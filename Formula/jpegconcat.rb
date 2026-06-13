@@ -30,6 +30,7 @@ class Jpegconcat < Formula
       #!/bin/bash
       exec "#{libexec}/bin/python" -B "#{libexec}/concat_jpeg.py" "$@"
     EOS
+    (bin/"jpegconcat").chmod 0755
   end
 
   test do
