@@ -7,12 +7,21 @@ edge colors — no need to specify anything.
 
 ---
 
-## One-time setup
+## Install
 
-Requires Python 3 (pre-installed on Mac) and two libraries:
+**Via Homebrew (recommended):**
+
+```
+brew tap pathanin/jpegconcat https://github.com/pathanin/jpegconcat
+brew install jpegconcat
+jpegconcat photo1.jpg photo2.jpg
+```
+
+**Manually (requires Python 3):**
 
 ```
 pip3 install Pillow numpy
+python3 concat_jpeg.py photo1.jpg photo2.jpg
 ```
 
 ---
