@@ -17,8 +17,11 @@ Auto-detection (both on by default):
 import argparse
 import os
 import re
+import shutil
 import struct
+import subprocess
 import sys
+import tempfile
 
 try:
     from PIL import Image, ExifTags
@@ -46,72 +49,154 @@ _STD_LUMA = [
     72, 92, 95, 98, 112, 100, 103, 99,
 ]
 
+# MCU block dimensions indexed by subsampling value (0=4:4:4, 1=4:2:2, 2=4:2:0)
+_MCU_DIMS = {0: (8, 8), 1: (16, 8), 2: (16, 16)}
+
 
 # ── JPEG parameter detection ──────────────────────────────────────────────────
 
 def _jpeg_params(path):
     """
-    Return (quality, subsampling) via a single streaming JPEG marker scan.
-    Reads only the header (stops at SOS / pixel data), never loading the full file.
+    Return (qtables, quality, subsampling) for a JPEG file.
+
+    qtables — Pillow's img.quantization dict (exact tables from libjpeg, suitable
+              for canvas.save(qtables=...)), or None if unavailable.
+    quality — integer estimate derived from the luma table, for display only.
+    subsampling — 0/1/2 (4:4:4 / 4:2:2 / 4:2:0) from the SOF marker.
     """
+    qtables = None
     quality = 85
     subsampling = 2
-    have_q = have_s = False
 
-    with open(path, "rb") as f:
-        if f.read(2) != b'\xff\xd8':
-            return quality, subsampling
+    # Quality + tables: use Pillow's libjpeg-parsed quantization dict (header-only open)
+    try:
+        _img = Image.open(path)
+        if _img.quantization:
+            qtables = _img.quantization
+            tbl = qtables.get(0, [])
+            if len(tbl) == 64:
+                s = sum(tbl[k] * 100 / _STD_LUMA[k] for k in range(64)) / 64
+                q = (200 - s) / 2 if s <= 100 else 5000 / s
+                quality = max(1, min(95, round(q)))
+    except Exception:
+        pass
 
-        while not (have_q and have_s):
-            b = f.read(2)
-            if len(b) < 2 or b[0] != 0xFF:
-                break
-            marker = b[1]
-            # standalone markers (no length field)
-            if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
-                continue
-            # SOS — pixel data starts here; nothing useful follows in the header
-            if marker == 0xDA:
-                break
-            lb = f.read(2)
-            if len(lb) < 2:
-                break
-            length = struct.unpack(">H", lb)[0]
-            seg = f.read(length - 2)
-
-            if marker == 0xDB and not have_q:  # DQT
-                j = 0
-                while j < len(seg):
-                    prec_id = seg[j]; j += 1
-                    precision = (prec_id >> 4) + 1
-                    table_id = prec_id & 0x0F
-                    tbl = []
-                    for _ in range(64):
-                        if precision == 1:
-                            tbl.append(seg[j]); j += 1
-                        else:
-                            tbl.append(struct.unpack(">H", seg[j:j+2])[0]); j += 2
-                    if table_id == 0:  # luma table → compute quality
-                        s = sum(tbl[k] * 100 / _STD_LUMA[k] for k in range(64)) / 64
-                        q = (200 - s) / 2 if s <= 100 else 5000 / s
-                        quality = max(1, min(95, round(q)))
-                        have_q = True
+    # Subsampling: stream the SOF marker (no clean public Pillow API for this)
+    try:
+        with open(path, "rb") as f:
+            if f.read(2) == b'\xff\xd8':
+                while True:
+                    b = f.read(2)
+                    if len(b) < 2 or b[0] != 0xFF:
                         break
+                    marker = b[1]
+                    if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
+                        continue
+                    if marker == 0xDA:
+                        break
+                    lb = f.read(2)
+                    if len(lb) < 2:
+                        break
+                    seg = f.read(struct.unpack(">H", lb)[0] - 2)
+                    if marker in (0xC0, 0xC1, 0xC2):
+                        if len(seg) >= 11 and seg[5] >= 3:
+                            y_h,  y_v  = seg[7] >> 4, seg[7] & 0xF
+                            cb_h, cb_v = seg[10] >> 4, seg[10] & 0xF
+                            if y_h == cb_h and y_v == cb_v:
+                                subsampling = 0
+                            elif y_v == cb_v:
+                                subsampling = 1
+                            else:
+                                subsampling = 2
+                        break
+    except Exception:
+        pass
 
-            elif marker in (0xC0, 0xC1, 0xC2) and not have_s:  # SOF0/1/2
-                # seg layout: precision(1) height(2) width(2) ncomp(1) [id samp qtbl]×ncomp
-                if len(seg) >= 11 and seg[5] >= 3:
-                    y_h,  y_v  = seg[7] >> 4, seg[7] & 0xF
-                    cb_h, cb_v = seg[10] >> 4, seg[10] & 0xF
-                    if y_h == cb_h and y_v == cb_v:
-                        subsampling = 0
-                    elif y_v == cb_v:
-                        subsampling = 1
-                    else:
-                        subsampling = 2
-                have_s = True
+    return qtables, quality, subsampling
 
-    return quality, subsampling
+
+# ── jpegtran lossless fast-path ───────────────────────────────────────────────
+
+def _try_lossless(image_paths, images, output_path, direction, qtables, subsampling):
+    """
+    Attempt lossless DCT-level concatenation via jpegtran -drop.
+    Returns True on success, False if any precondition is unmet.
+
+    Preconditions:
+      - jpegtran (libjpeg-turbo ≥ 1.4) is in PATH
+      - All inputs are JPEG with identical chroma subsampling
+      - The perpendicular dimension of each image and every join offset
+        are multiples of the MCU block size for that subsampling
+    """
+    jpegtran = shutil.which("jpegtran")
+    if not jpegtran:
+        return False
+
+    if not all(p.lower().endswith((".jpg", ".jpeg")) for p in image_paths):
+        return False
+
+    # All inputs must share the same subsampling as the first image
+    for path in image_paths[1:]:
+        _, _, s = _jpeg_params(path)
+        if s != subsampling:
+            return False
+
+    mcu_w, mcu_h = _MCU_DIMS.get(subsampling, (8, 8))
+
+    if direction == "horizontal":
+        # Every image's height and every cumulative x-offset must be MCU-aligned
+        if not all(img.height % mcu_h == 0 for img in images):
+            return False
+        x = 0
+        for img in images[:-1]:
+            x += img.width
+            if x % mcu_w != 0:
+                return False
+    else:  # vertical
+        if not all(img.width % mcu_w == 0 for img in images):
+            return False
+        y = 0
+        for img in images[:-1]:
+            y += img.height
+            if y % mcu_h != 0:
+                return False
+
+    with tempfile.TemporaryDirectory() as td:
+        # Build a blank black canvas JPEG with the source's quantization tables
+        if direction == "horizontal":
+            canvas_size = (sum(img.width for img in images), max(img.height for img in images))
+        else:
+            canvas_size = (max(img.width for img in images), sum(img.height for img in images))
+
+        canvas_path = os.path.join(td, "canvas.jpg")
+        blank = Image.new("RGB", canvas_size, (0, 0, 0))
+        if qtables:
+            blank.save(canvas_path, "JPEG", qtables=qtables, subsampling=subsampling)
+        else:
+            blank.save(canvas_path, "JPEG", quality=85, subsampling=subsampling)
+
+        # Drop each source image into the canvas at its offset (DCT-level, no re-encode)
+        current = canvas_path
+        x = y = 0
+        for idx, (path, img) in enumerate(zip(image_paths, images)):
+            out_path = os.path.join(td, f"step_{idx}.jpg")
+            result = subprocess.run(
+                [jpegtran, "-copy", "none", "-drop", f"+{x}+{y}", path, current],
+                capture_output=True,
+            )
+            if result.returncode != 0 or not result.stdout:
+                return False
+            with open(out_path, "wb") as fout:
+                fout.write(result.stdout)
+            current = out_path
+            if direction == "horizontal":
+                x += img.width
+            else:
+                y += img.height
+
+        shutil.copy(current, output_path)
+
+    return True
 
 
 # ── Filename / EXIF ordering (fallback) ───────────────────────────────────────
@@ -255,31 +340,42 @@ def concat_images(image_paths, output_path, direction="auto", order="auto"):
 
     print(f"\nLayout: {direction}")
 
-    if direction == "horizontal":
-        total_w = sum(img.width  for img in images)
-        total_h = max(img.height for img in images)
-        canvas  = Image.new("RGB", (total_w, total_h), (0, 0, 0))
-        x = 0
-        for img in images:
-            canvas.paste(img, (x, 0))
-            x += img.width
-    else:
-        total_w = max(img.width  for img in images)
-        total_h = sum(img.height for img in images)
-        canvas  = Image.new("RGB", (total_w, total_h), (0, 0, 0))
-        y = 0
-        for img in images:
-            canvas.paste(img, (0, y))
-            y += img.height
-
+    # Detect encoding params from the first input image
     first = image_paths[0]
     if first.lower().endswith((".jpg", ".jpeg")):
-        quality, subsampling = _jpeg_params(first)
+        qtables, quality, subsampling = _jpeg_params(first)
     else:
-        quality, subsampling = 85, 2
+        qtables, quality, subsampling = None, 85, 2
 
-    canvas.save(output_path, "JPEG", quality=quality, subsampling=subsampling)
+    # ── Lossless fast-path: jpegtran -drop (DCT-level, no pixel decode/encode) ─
+    lossless = _try_lossless(image_paths, images, output_path, direction, qtables, subsampling)
 
+    # ── Pillow re-encode fallback ─────────────────────────────────────────────
+    if not lossless:
+        if direction == "horizontal":
+            total_w = sum(img.width  for img in images)
+            total_h = max(img.height for img in images)
+            canvas  = Image.new("RGB", (total_w, total_h), (0, 0, 0))
+            x = 0
+            for img in images:
+                canvas.paste(img, (x, 0))
+                x += img.width
+        else:
+            total_w = max(img.width  for img in images)
+            total_h = sum(img.height for img in images)
+            canvas  = Image.new("RGB", (total_w, total_h), (0, 0, 0))
+            y = 0
+            for img in images:
+                canvas.paste(img, (0, y))
+                y += img.height
+
+        if qtables:
+            # Pass the source's exact quantization tables rather than a quality estimate
+            canvas.save(output_path, "JPEG", qtables=qtables, subsampling=subsampling)
+        else:
+            canvas.save(output_path, "JPEG", quality=quality, subsampling=subsampling)
+
+    # ── Size report ───────────────────────────────────────────────────────────
     input_sizes = [os.path.getsize(p) for p in image_paths]
     output_size = os.path.getsize(output_path)
     combined    = sum(input_sizes)
@@ -290,7 +386,14 @@ def concat_images(image_paths, output_path, direction="auto", order="auto"):
     print(f"  ─────────────────────────")
     print(f"  Combined input:  {combined    // 1024} KB")
     print(f"  Output:          {output_size // 1024} KB  ({output_size / combined:.2f}x)")
-    print(f"\nEncoding: quality={quality}, subsampling={['4:4:4','4:2:2','4:2:0'][subsampling]}")
+
+    if lossless:
+        enc = "lossless (jpegtran DCT)"
+    elif qtables:
+        enc = f"quality≈{quality} (exact source tables)"
+    else:
+        enc = f"quality={quality}"
+    print(f"\nEncoding: {enc}, subsampling={['4:4:4','4:2:2','4:2:0'][subsampling]}")
     print(f"Saved: {output_path}")
 
 
