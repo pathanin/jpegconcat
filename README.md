@@ -13,9 +13,14 @@ edge colors — no need to specify anything.
 
 ```
 brew tap pathanin/jpegconcat https://github.com/pathanin/jpegconcat
+brew trust pathanin/jpegconcat
 brew install jpegconcat
 jpegconcat photo1.jpg photo2.jpg
 ```
+
+> **Note (Homebrew 6.0+):** Homebrew 6.0 requires taps to be trusted before installing.
+> The `brew trust pathanin/jpegconcat` step above grants that trust. Without it the build
+> fails silently inside the sandbox. Run `brew untrust pathanin/jpegconcat` to revoke.
 
 **Manually (requires Python 3):**
 
