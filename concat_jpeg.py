@@ -117,7 +117,7 @@ def _jpeg_params(path):
 
 # ── jpegtran lossless fast-path ───────────────────────────────────────────────
 
-def _try_lossless(image_paths, images, output_path, direction, qtables, subsampling):
+def _try_lossless(image_paths, images, input_formats, output_path, direction, qtables, subsampling):
     """
     Attempt lossless DCT-level concatenation via jpegtran -drop.
     Returns True on success, False if any precondition is unmet.
@@ -132,7 +132,7 @@ def _try_lossless(image_paths, images, output_path, direction, qtables, subsampl
     if not jpegtran:
         return False
 
-    if not all(p.lower().endswith((".jpg", ".jpeg")) for p in image_paths):
+    if not all(fmt == "JPEG" for fmt in input_formats):
         return False
 
     # All inputs must share the same subsampling as the first image
@@ -301,7 +301,9 @@ def find_best_arrangement_2(paths, images, fix_order, fix_direction):
 # ── Main concat logic ─────────────────────────────────────────────────────────
 
 def concat_images(image_paths, output_path, direction="auto", order="auto"):
-    images = [Image.open(p).convert("RGB") for p in image_paths]
+    opened = [Image.open(p) for p in image_paths]
+    input_formats = [img.format for img in opened]
+    images = [img.convert("RGB") for img in opened]
 
     fix_order     = (order != "auto")
     fix_direction = None if direction == "auto" else direction
@@ -342,13 +344,13 @@ def concat_images(image_paths, output_path, direction="auto", order="auto"):
 
     # Detect encoding params from the first input image
     first = image_paths[0]
-    if first.lower().endswith((".jpg", ".jpeg")):
+    if input_formats[0] == "JPEG":
         qtables, quality, subsampling = _jpeg_params(first)
     else:
         qtables, quality, subsampling = None, 85, 2
 
     # ── Lossless fast-path: jpegtran -drop (DCT-level, no pixel decode/encode) ─
-    lossless = _try_lossless(image_paths, images, output_path, direction, qtables, subsampling)
+    lossless = _try_lossless(image_paths, images, input_formats, output_path, direction, qtables, subsampling)
 
     # ── Pillow re-encode fallback ─────────────────────────────────────────────
     if not lossless:
@@ -369,11 +371,14 @@ def concat_images(image_paths, output_path, direction="auto", order="auto"):
                 canvas.paste(img, (0, y))
                 y += img.height
 
-        if qtables:
-            # Pass the source's exact quantization tables rather than a quality estimate
-            canvas.save(output_path, "JPEG", qtables=qtables, subsampling=subsampling)
+        out_ext = os.path.splitext(output_path)[1].lower()
+        if out_ext in (".jpg", ".jpeg"):
+            if qtables:
+                canvas.save(output_path, "JPEG", qtables=qtables, subsampling=subsampling)
+            else:
+                canvas.save(output_path, "JPEG", quality=quality, subsampling=subsampling)
         else:
-            canvas.save(output_path, "JPEG", quality=quality, subsampling=subsampling)
+            canvas.save(output_path)
 
     # ── Size report ───────────────────────────────────────────────────────────
     input_sizes = [os.path.getsize(p) for p in image_paths]
@@ -387,25 +392,47 @@ def concat_images(image_paths, output_path, direction="auto", order="auto"):
     print(f"  Combined input:  {combined    // 1024} KB")
     print(f"  Output:          {output_size // 1024} KB  ({output_size / combined:.2f}x)")
 
-    if lossless:
-        enc = "lossless (jpegtran DCT)"
-    elif qtables:
-        enc = f"quality≈{quality} (exact source tables)"
+    out_ext = os.path.splitext(output_path)[1].lower()
+    if out_ext in (".jpg", ".jpeg"):
+        if lossless:
+            enc = "lossless (jpegtran DCT)"
+        elif qtables:
+            enc = f"quality≈{quality} (exact source tables)"
+        else:
+            enc = f"quality={quality}"
+        print(f"\nEncoding: {enc}, subsampling={['4:4:4','4:2:2','4:2:0'][subsampling]}")
     else:
-        enc = f"quality={quality}"
-    print(f"\nEncoding: {enc}, subsampling={['4:4:4','4:2:2','4:2:0'][subsampling]}")
+        print(f"\nEncoding: {out_ext.lstrip('.')} (lossless)")
     print(f"Saved: {output_path}")
+
+
+_FORMAT_TO_EXT = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp", "TIFF": ".tiff", "BMP": ".bmp"}
+
+def _detect_format(path):
+    """Return Pillow format string (e.g. 'JPEG', 'PNG') detected from file bytes."""
+    with Image.open(path) as img:
+        return img.format
+
+def _output_ext(inputs):
+    """Return a common extension if all inputs share the same actual format, else .jpg."""
+    fmts = {_detect_format(p) for p in inputs}
+    if len(fmts) == 1:
+        fmt = fmts.pop()
+        return _FORMAT_TO_EXT.get(fmt, os.path.splitext(inputs[0])[1].lower() or ".jpg")
+    return ".jpg"
 
 
 def make_output_path(inputs):
     """Auto-generate output path next to the first input, with dedup guard."""
     out_dir = os.path.dirname(os.path.abspath(inputs[0]))
-    candidate = os.path.join(out_dir, "concat.jpg")
+    ext = _output_ext(inputs)
+    stem = "concat"
+    candidate = os.path.join(out_dir, f"{stem}{ext}")
     if not os.path.exists(candidate):
         return candidate
     n = 2
     while True:
-        candidate = os.path.join(out_dir, f"concat_{n}.jpg")
+        candidate = os.path.join(out_dir, f"{stem}_{n}{ext}")
         if not os.path.exists(candidate):
             return candidate
         n += 1
