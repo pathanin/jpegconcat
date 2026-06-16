@@ -50,29 +50,6 @@ def grayscale_jpeg():
     os.unlink(path)
 
 
-# ── Tests: _exif_dt ───────────────────────────────────────────────────────────
-
-class TestExifDt:
-    def test_returns_none_for_no_exif(self, rgb_image):
-        """No EXIF data → returns None."""
-        path, img = rgb_image
-        assert cj._exif_dt(img) is None
-
-    def test_returns_none_on_exception(self):
-        """Malformed or non-image input does not crash."""
-        assert cj._exif_dt(None) is None
-
-    def test_direct_lookup_is_fast(self):
-        """Tag ID 0x9003 is used directly (not O(n) iteration)."""
-        # Create an image with DateTimeOriginal set
-        img = Image.new("RGB", (10, 10))
-        # _exif_dt uses .getexif() which returns a mutable Exif object
-        exif = img.getexif()
-        exif[0x9003] = "2024:01:15 12:30:00"
-        result = cj._exif_dt(img)
-        assert result == "2024:01:15 12:30:00"
-
-
 # ── Tests: _jpeg_params ───────────────────────────────────────────────────────
 
 class TestJpegParams:
@@ -187,56 +164,9 @@ class TestEdgeMatching:
         assert direction in ("horizontal", "vertical")
 
 
-# ── Tests: auto_direction_fallback ────────────────────────────────────────────
-
-class TestAutoDirectionFallback:
-    def test_portrait_majority(self):
-        """More portrait images → horizontal layout."""
-        images = [Image.new("RGB", (100, 200)) for _ in range(3)]  # portrait
-        images.append(Image.new("RGB", (200, 100)))  # landscape
-        assert cj.auto_direction_fallback(images) == "horizontal"
-
-    def test_landscape_majority(self):
-        """More landscape images → vertical layout."""
-        images = [Image.new("RGB", (200, 100)) for _ in range(3)]  # landscape
-        images.append(Image.new("RGB", (100, 200)))  # portrait
-        assert cj.auto_direction_fallback(images) == "vertical"
-
-    def test_tie_breaker(self):
-        """Tie (equal portrait/landscape) → horizontal (portrait >= half)."""
-        images = [Image.new("RGB", (100, 200)), Image.new("RGB", (200, 100))]
-        assert cj.auto_direction_fallback(images) == "horizontal"
-
-    def test_all_square(self):
-        """Square images (height == width) are counted as portrait."""
-        images = [Image.new("RGB", (100, 100)) for _ in range(3)]
-        assert cj.auto_direction_fallback(images) == "horizontal"
-
-    def test_single_image(self):
-        """Single image falls to horizontal (height >= width)."""
-        img = Image.new("RGB", (100, 200))  # portrait
-        assert cj.auto_direction_fallback([img]) == "horizontal"
-
-
-# ── Tests: _output_ext, _output_ext_from_fmts, make_output_path ───────────────
+# ── Tests: _make_output_path ──────────────────────────────────────────────────
 
 class TestOutputExtensions:
-    def test_output_ext_all_same(self):
-        """All JPEG inputs → .jpg extension."""
-        assert cj._output_ext_from_fmts(["JPEG", "JPEG"]) == ".jpg"
-
-    def test_output_ext_all_png(self):
-        """All PNG inputs → .png extension."""
-        assert cj._output_ext_from_fmts(["PNG", "PNG"]) == ".png"
-
-    def test_output_ext_mixed(self):
-        """Mixed formats → .jpg."""
-        assert cj._output_ext_from_fmts(["JPEG", "PNG"]) == ".jpg"
-
-    def test_output_ext_empty(self):
-        """Empty format list → .jpg."""
-        assert cj._output_ext_from_fmts([]) == ".jpg"
-
     def test_make_output_path_no_collision(self, tmpdir):
         """No existing file → uses concat.ext."""
         img = Image.new("RGB", (10, 10))
@@ -273,22 +203,6 @@ class TestOutputExtensions:
         opened = [Image.open(path)]
         result = cj._make_output_path([path], opened)
         assert result == os.path.join(tmpdir, "concat_4.png")
-
-    def test_detect_format(self, tmpdir):
-        """_detect_format returns the correct format string."""
-        path = os.path.join(tmpdir, "test.png")
-        Image.new("RGB", (10, 10)).save(path, "PNG")
-        assert cj._detect_format(path) == "PNG"
-
-        path = os.path.join(tmpdir, "test.jpg")
-        Image.new("RGB", (10, 10)).save(path, "JPEG")
-        assert cj._detect_format(path) == "JPEG"
-
-    def test_legacy_output_ext(self, tmpdir):
-        """Legacy _output_ext still works and detects from file bytes."""
-        path = os.path.join(tmpdir, "test.png")
-        Image.new("RGB", (10, 10)).save(path, "PNG")
-        assert cj._output_ext([path]) == ".png"
 
 
 # ── Tests: _sort_key ──────────────────────────────────────────────────────────
@@ -493,15 +407,6 @@ class TestBoundaryConditions:
         result = Image.open(output)
         assert result.size == (501, 500)  # 500+1 wide, max(1,500)=500 tall
 
-    def test_zero_sized_files_prevented(self, tmpdir):
-        """Zero-byte file raises UnidentifiedImageError in _detect_format."""
-        from PIL import UnidentifiedImageError
-        path = os.path.join(tmpdir, "empty.jpg")
-        with open(path, "wb") as f:
-            f.write(b"")
-        with pytest.raises(UnidentifiedImageError):
-            cj._detect_format(path)
-
 
 # ── Tests: lossless path (jpegtran-dependent) ─────────────────────────────────
 
@@ -615,7 +520,3 @@ class TestFormatToExt:
         assert cj._FORMAT_TO_EXT["ICO"] == ".ico"
         assert cj._FORMAT_TO_EXT["PDF"] == ".pdf"
 
-    def test_legacy_format_map(self):
-        """Legacy _FORMAT_TO_EXT_LEGACY is backward compatible."""
-        assert cj._FORMAT_TO_EXT_LEGACY["JPEG"] == ".jpg"
-        assert cj._FORMAT_TO_EXT_LEGACY["PNG"] == ".png"

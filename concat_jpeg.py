@@ -77,6 +77,7 @@ def _jpeg_params(path):
     # Quality + tables: use Pillow's libjpeg-parsed quantization dict (header-only open)
     try:
         _img = Image.open(path)
+        is_grayscale = (_img.mode == "L")
         if _img.quantization:
             qtables = _img.quantization
             tbl = qtables.get(0, [])
@@ -87,7 +88,7 @@ def _jpeg_params(path):
     except Exception:
         pass
 
-    # Subsampling + grayscale: stream the SOF marker (no clean public Pillow API for this)
+    # Subsampling: stream the SOF marker (no clean public Pillow API for this)
     try:
         with open(path, "rb") as f:
             if f.read(2) == b'\xff\xd8':
@@ -105,20 +106,15 @@ def _jpeg_params(path):
                         break
                     seg = f.read(struct.unpack(">H", lb)[0] - 2)
                     if marker in (0xC0, 0xC1, 0xC2):
-                        # SOF0 / SOF1 / SOF2 marker
-                        if len(seg) >= 6:
-                            n_components = seg[5]
-                            if n_components == 1:
-                                is_grayscale = True
-                            elif n_components >= 3 and len(seg) >= 15:
-                                y_h,  y_v  = seg[7] >> 4, seg[7] & 0xF
-                                cb_h, cb_v = seg[10] >> 4, seg[10] & 0xF
-                                if y_h == cb_h and y_v == cb_v:
-                                    subsampling = 0
-                                elif y_v == cb_v:
-                                    subsampling = 1
-                                else:
-                                    subsampling = 2
+                        if len(seg) >= 15 and seg[5] >= 3:
+                            y_h,  y_v  = seg[7] >> 4, seg[7] & 0xF
+                            cb_h, cb_v = seg[10] >> 4, seg[10] & 0xF
+                            if y_h == cb_h and y_v == cb_v:
+                                subsampling = 0
+                            elif y_v == cb_v:
+                                subsampling = 1
+                            else:
+                                subsampling = 2
                         break
     except Exception:
         pass
@@ -220,28 +216,11 @@ def _try_lossless(image_paths, images, input_formats, output_path, direction, qt
 
 # ── Filename / EXIF ordering (fallback) ───────────────────────────────────────
 
-def _exif_dt(img):
-    """Extract DateTimeOriginal from an already-open PIL Image (no extra file I/O).
-
-    Uses direct tag ID (0x9003 = 36867) instead of iterating all EXIF keys.
-    """
-    try:
-        return img.getexif().get(0x9003)  # 0x9003 = DateTimeOriginal
-    except Exception:
-        pass
-    return None
-
-
 def _sort_key(path, img):
-    name = os.path.basename(path)
-    nums = tuple(int(n) for n in re.findall(r"\d+", name))
-    return (nums, _exif_dt(img) or "", os.path.getmtime(path))
-
-
-def auto_direction_fallback(images):
-    """Portrait majority → horizontal; landscape majority → vertical."""
-    portrait_count = sum(1 for img in images if img.height >= img.width)
-    return "horizontal" if portrait_count >= len(images) - portrait_count else "vertical"
+    nums = tuple(int(n) for n in re.findall(r"\d+", os.path.basename(path)))
+    try: dt = img.getexif().get(0x9003) or ""
+    except Exception: dt = ""
+    return (nums, dt, os.path.getmtime(path))
 
 
 # ── Edge-color seam matching ──────────────────────────────────────────────────
@@ -323,23 +302,11 @@ _FORMAT_TO_EXT = {
 }
 
 
-def _output_ext_from_fmts(formats):
-    """Return common extension from a list of Pillow format strings, else .jpg."""
-    unique = {f for f in formats if f}
-    if len(unique) == 1:
-        fmt = unique.pop()
-        return _FORMAT_TO_EXT.get(fmt, ".jpg")
-    return ".jpg"
-
-
 def _make_output_path(image_paths, opened_images):
-    """Auto-generate output path next to the first input, with dedup guard.
-
-    Uses already-opened PIL Image objects to determine output extension,
-    avoiding redundant file I/O.
-    """
+    """Auto-generate output path next to the first input, with dedup guard."""
     out_dir = os.path.dirname(os.path.abspath(image_paths[0]))
-    ext = _output_ext_from_fmts([img.format for img in opened_images])
+    fmts = {img.format for img in opened_images if img.format}
+    ext = _FORMAT_TO_EXT.get(fmts.pop(), ".jpg") if len(fmts) == 1 else ".jpg"
     stem = "concat"
     candidate = os.path.join(out_dir, f"{stem}{ext}")
     if not os.path.exists(candidate):
@@ -394,7 +361,8 @@ def concat_images(image_paths, output_path=None, direction="auto", order="auto")
                     print(f"  {os.path.basename(p)}")
 
         if fix_direction is None:
-            direction = auto_direction_fallback(images)
+            portrait_count = sum(1 for img in images if img.height >= img.width)
+            direction = "horizontal" if portrait_count * 2 >= len(images) else "vertical"
             print(f"Direction: auto (orientation heuristic) → {direction}")
         else:
             direction = fix_direction
@@ -438,7 +406,7 @@ def concat_images(image_paths, output_path=None, direction="auto", order="auto")
         out_ext = os.path.splitext(output_path)[1].lower()
         if out_ext in (".jpg", ".jpeg"):
             # Preserve EXIF from the first source image (in the final arrangement)
-            exif_data = opened[input_formats.index(input_formats[0])].info.get('exif') if input_formats[0] == "JPEG" else None
+            exif_data = opened[0].info.get('exif') if input_formats[0] == "JPEG" else None
 
             save_kwargs = {"exif": exif_data} if exif_data else {}
             if is_grayscale:
@@ -480,48 +448,6 @@ def concat_images(image_paths, output_path=None, direction="auto", order="auto")
         print(f"\nEncoding: {out_ext.lstrip('.')} (lossless)")
     print(f"Saved: {output_path}")
 
-
-# ── Legacy helpers (kept for external callers) ────────────────────────────────
-
-_FORMAT_TO_EXT_LEGACY = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp", "TIFF": ".tiff", "BMP": ".bmp"}
-
-def _detect_format(path):
-    """Return Pillow format string (e.g. 'JPEG', 'PNG') detected from file bytes."""
-    with Image.open(path) as img:
-        return img.format
-
-
-def _output_ext(inputs):
-    """Return a common extension if all inputs share the same actual format, else .jpg.
-
-    Note: opens each input file. Prefer concat_images() which computes
-    the extension from already-opened images to avoid redundant I/O.
-    """
-    fmts = {_detect_format(p) for p in inputs}
-    if len(fmts) == 1:
-        fmt = fmts.pop()
-        return _FORMAT_TO_EXT_LEGACY.get(fmt, os.path.splitext(inputs[0])[1].lower() or ".jpg")
-    return ".jpg"
-
-
-def make_output_path(inputs):
-    """Auto-generate output path next to the first input, with dedup guard.
-
-    Note: opens each input file internally. For new code, use concat_images()
-    with output_path=None instead.
-    """
-    out_dir = os.path.dirname(os.path.abspath(inputs[0]))
-    ext = _output_ext(inputs)
-    stem = "concat"
-    candidate = os.path.join(out_dir, f"{stem}{ext}")
-    if not os.path.exists(candidate):
-        return candidate
-    n = 2
-    while True:
-        candidate = os.path.join(out_dir, f"{stem}_{n}{ext}")
-        if not os.path.exists(candidate):
-            return candidate
-        n += 1
 
 
 def main():
