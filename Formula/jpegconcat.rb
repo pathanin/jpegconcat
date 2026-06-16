@@ -51,13 +51,16 @@ class Jpegconcat < Formula
 
     ["pillow", "numpy"].each do |pkg|
       whl_src = resource(pkg).cached_download
-      # Strip Homebrew's hash prefix so pip sees a proper wheel filename,
-      # and copy into buildpath so the install sandbox can read it.
+      # Copy wheel to buildpath with a clean filename — the Homebrew 6.0 sandbox
+      # blocks exec of scripts inside the keg, so we use the system python3.12
+      # (sandbox-allowed) with --python targeting the venv instead of libexec/bin/pip.
       wheel_name = whl_src.basename.to_s.sub(/\A[0-9a-f]+-+/, "")
       whl_dst = buildpath/wheel_name
       cp whl_src, whl_dst
       begin
-        system libexec/"bin/pip", "install", "--no-deps", "--no-compile", whl_dst
+        system "python3.12", "-m", "pip",
+               "--python=#{libexec}/bin/python",
+               "install", "--no-deps", "--no-compile", whl_dst
       rescue BuildError => e
         opoo "Pre-built #{pkg} wheel failed (#{e.message}), building from source..."
         venv.pip_install resource("#{pkg}-sdist")
