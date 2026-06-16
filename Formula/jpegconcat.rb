@@ -51,9 +51,13 @@ class Jpegconcat < Formula
 
     ["pillow", "numpy"].each do |pkg|
       begin
-        venv.pip_install resource(pkg)
-      rescue => e
-        opoo "Pre-built #{pkg} wheel failed (#{e.class}: #{e.message}), building from source..."
+        # Call pip directly with the cached .whl path — venv.pip_install adds
+        # --no-binary=:all: which prevents wheel installs, and also stages the
+        # .whl as an unpacked directory that pip can't install from.
+        system libexec/"bin/pip", "install", "--no-deps", "--no-compile",
+               resource(pkg).cached_download
+      rescue BuildError => e
+        opoo "Pre-built #{pkg} wheel failed (#{e.message}), building from source..."
         venv.pip_install resource("#{pkg}-sdist")
       end
     end
