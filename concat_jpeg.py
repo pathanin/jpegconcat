@@ -12,6 +12,10 @@ Auto-detection (both on by default):
              embedded numeric sequence in filename, then EXIF timestamp, then mtime
   direction: for 2 images, determined by edge-color seam matching; otherwise
              portrait → horizontal, landscape → vertical
+
+Note: The lossless jpegtran fast-path uses -copy none and strips all metadata
+(EXIF, ICC profiles, XMP). The Pillow fallback preserves EXIF from the first
+source image.
 """
 
 import argparse
@@ -24,7 +28,7 @@ import sys
 import tempfile
 
 try:
-    from PIL import Image, ExifTags
+    from PIL import Image
 except ImportError:
     print("Pillow not installed. Run: pip install Pillow --break-system-packages")
     sys.exit(1)
@@ -57,16 +61,18 @@ _MCU_DIMS = {0: (8, 8), 1: (16, 8), 2: (16, 16)}
 
 def _jpeg_params(path):
     """
-    Return (qtables, quality, subsampling) for a JPEG file.
+    Return (qtables, quality, subsampling, is_grayscale) for a JPEG file.
 
     qtables — Pillow's img.quantization dict (exact tables from libjpeg, suitable
               for canvas.save(qtables=...)), or None if unavailable.
     quality — integer estimate derived from the luma table, for display only.
     subsampling — 0/1/2 (4:4:4 / 4:2:2 / 4:2:0) from the SOF marker.
+    is_grayscale — True when the JPEG SOF marker has exactly 1 component.
     """
     qtables = None
     quality = 85
     subsampling = 2
+    is_grayscale = False
 
     # Quality + tables: use Pillow's libjpeg-parsed quantization dict (header-only open)
     try:
@@ -81,7 +87,7 @@ def _jpeg_params(path):
     except Exception:
         pass
 
-    # Subsampling: stream the SOF marker (no clean public Pillow API for this)
+    # Subsampling + grayscale: stream the SOF marker (no clean public Pillow API for this)
     try:
         with open(path, "rb") as f:
             if f.read(2) == b'\xff\xd8':
@@ -99,20 +105,25 @@ def _jpeg_params(path):
                         break
                     seg = f.read(struct.unpack(">H", lb)[0] - 2)
                     if marker in (0xC0, 0xC1, 0xC2):
-                        if len(seg) >= 11 and seg[5] >= 3:
-                            y_h,  y_v  = seg[7] >> 4, seg[7] & 0xF
-                            cb_h, cb_v = seg[10] >> 4, seg[10] & 0xF
-                            if y_h == cb_h and y_v == cb_v:
-                                subsampling = 0
-                            elif y_v == cb_v:
-                                subsampling = 1
-                            else:
-                                subsampling = 2
+                        # SOF0 / SOF1 / SOF2 marker
+                        if len(seg) >= 6:
+                            n_components = seg[5]
+                            if n_components == 1:
+                                is_grayscale = True
+                            elif n_components >= 3 and len(seg) >= 15:
+                                y_h,  y_v  = seg[7] >> 4, seg[7] & 0xF
+                                cb_h, cb_v = seg[10] >> 4, seg[10] & 0xF
+                                if y_h == cb_h and y_v == cb_v:
+                                    subsampling = 0
+                                elif y_v == cb_v:
+                                    subsampling = 1
+                                else:
+                                    subsampling = 2
                         break
     except Exception:
         pass
 
-    return qtables, quality, subsampling
+    return qtables, quality, subsampling, is_grayscale
 
 
 # ── jpegtran lossless fast-path ───────────────────────────────────────────────
@@ -120,10 +131,17 @@ def _jpeg_params(path):
 def _try_lossless(image_paths, images, input_formats, output_path, direction, qtables, subsampling):
     """
     Attempt lossless DCT-level concatenation via jpegtran -drop.
+
     Returns True on success, False if any precondition is unmet.
 
+    NOTE: jpegtran is called with -copy none, so all metadata (EXIF, ICC
+    profiles, XMP) is stripped from the output. This is unavoidable with
+    the DCT-level compositing approach — there is no source image whose
+    metadata accurately describes the composite. Use the Pillow fallback
+    path if metadata preservation is required.
+
     Preconditions:
-      - jpegtran (libjpeg-turbo ≥ 1.4) is in PATH
+      - jpegtran (libjpeg-turbo >= 1.4) is in PATH
       - All inputs are JPEG with identical chroma subsampling
       - The perpendicular dimension of each image and every join offset
         are multiples of the MCU block size for that subsampling
@@ -137,7 +155,7 @@ def _try_lossless(image_paths, images, input_formats, output_path, direction, qt
 
     # All inputs must share the same subsampling as the first image
     for path in image_paths[1:]:
-        _, _, s = _jpeg_params(path)
+        _, _, s, _ = _jpeg_params(path)
         if s != subsampling:
             return False
 
@@ -176,6 +194,7 @@ def _try_lossless(image_paths, images, input_formats, output_path, direction, qt
             blank.save(canvas_path, "JPEG", quality=85, subsampling=subsampling)
 
         # Drop each source image into the canvas at its offset (DCT-level, no re-encode)
+        # -copy none: no metadata propagates (see docstring above)
         current = canvas_path
         x = y = 0
         for idx, (path, img) in enumerate(zip(image_paths, images)):
@@ -202,12 +221,12 @@ def _try_lossless(image_paths, images, input_formats, output_path, direction, qt
 # ── Filename / EXIF ordering (fallback) ───────────────────────────────────────
 
 def _exif_dt(img):
-    """Extract DateTimeOriginal from an already-open PIL Image (no extra file I/O)."""
+    """Extract DateTimeOriginal from an already-open PIL Image (no extra file I/O).
+
+    Uses direct tag ID (0x9003 = 36867) instead of iterating all EXIF keys.
+    """
     try:
-        exif = img.getexif()
-        for tag, val in exif.items():
-            if ExifTags.TAGS.get(tag) == "DateTimeOriginal":
-                return val
+        return img.getexif().get(0x9003)  # 0x9003 = DateTimeOriginal
     except Exception:
         pass
     return None
@@ -221,8 +240,8 @@ def _sort_key(path, img):
 
 def auto_direction_fallback(images):
     """Portrait majority → horizontal; landscape majority → vertical."""
-    portrait = sum(1 for img in images if img.height >= img.width)
-    return "horizontal" if portrait >= len(images) - portrait else "vertical"
+    portrait_count = sum(1 for img in images if img.height >= img.width)
+    return "horizontal" if portrait_count >= len(images) - portrait_count else "vertical"
 
 
 # ── Edge-color seam matching ──────────────────────────────────────────────────
@@ -262,15 +281,15 @@ def _seam_mad(img_a, side_a, img_b, side_b):
     return float(np.mean(np.abs(_edge_strip(img_a, side_a) - _edge_strip(img_b, side_b))))
 
 
-def find_best_arrangement_2(paths, images, fix_order, fix_direction):
+def find_best_arrangement_2(paths, images, preserve_order, fix_direction):
     """
     Try every allowed seam connection for 2 images and return
     (ordered_paths, ordered_images, direction) for the best match.
 
-    fix_order=True     → keep as-given order, only test directions
+    preserve_order=True     → keep as-given order, only test directions
     fix_direction=str  → keep that direction, only test orderings
     """
-    orders     = [[0, 1]] if fix_order else [[0, 1], [1, 0]]
+    orders     = [[0, 1]] if preserve_order else [[0, 1], [1, 0]]
     directions = [fix_direction] if fix_direction else ["horizontal", "vertical"]
 
     candidates = []
@@ -298,29 +317,72 @@ def find_best_arrangement_2(paths, images, fix_order, fix_direction):
     return [paths[i] for i in best_order], [images[i] for i in best_order], best_direction
 
 
+_FORMAT_TO_EXT = {
+    "JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp", "TIFF": ".tiff",
+    "BMP": ".bmp", "GIF": ".gif", "ICO": ".ico", "PDF": ".pdf",
+}
+
+
+def _output_ext_from_fmts(formats):
+    """Return common extension from a list of Pillow format strings, else .jpg."""
+    unique = {f for f in formats if f}
+    if len(unique) == 1:
+        fmt = unique.pop()
+        return _FORMAT_TO_EXT.get(fmt, ".jpg")
+    return ".jpg"
+
+
+def _make_output_path(image_paths, opened_images):
+    """Auto-generate output path next to the first input, with dedup guard.
+
+    Uses already-opened PIL Image objects to determine output extension,
+    avoiding redundant file I/O.
+    """
+    out_dir = os.path.dirname(os.path.abspath(image_paths[0]))
+    ext = _output_ext_from_fmts([img.format for img in opened_images])
+    stem = "concat"
+    candidate = os.path.join(out_dir, f"{stem}{ext}")
+    if not os.path.exists(candidate):
+        return candidate
+    n = 2
+    while True:
+        candidate = os.path.join(out_dir, f"{stem}_{n}{ext}")
+        if not os.path.exists(candidate):
+            return candidate
+        n += 1
+
+
 # ── Main concat logic ─────────────────────────────────────────────────────────
 
-def concat_images(image_paths, output_path, direction="auto", order="auto"):
+def concat_images(image_paths, output_path=None, direction="auto", order="auto"):
+    """Concatenate images preserving source encoding parameters.
+
+    output_path may be None — the path is auto-generated next to the first input.
+    """
     opened = [Image.open(p) for p in image_paths]
     input_formats = [img.format for img in opened]
+
+    if output_path is None:
+        output_path = _make_output_path(image_paths, opened)
+
     images = [img.convert("RGB") for img in opened]
 
-    fix_order     = (order != "auto")
+    preserve_order  = (order != "auto")
     fix_direction = None if direction == "auto" else direction
 
     use_edge_match = (
         _HAS_NUMPY
         and len(image_paths) == 2
-        and (not fix_order or fix_direction is None)  # at least one thing to decide
+        and (not preserve_order or fix_direction is None)  # at least one thing to decide
     )
 
     if use_edge_match:
         print("Order + direction: edge-color seam matching")
         image_paths, images, direction = find_best_arrangement_2(
-            image_paths, images, fix_order=fix_order, fix_direction=fix_direction
+            image_paths, images, preserve_order=preserve_order, fix_direction=fix_direction
         )
     else:
-        if not fix_order:
+        if not preserve_order:
             original = list(image_paths)
             paired = sorted(zip(image_paths, images), key=lambda t: _sort_key(*t))
             new_paths = [p for p, _ in paired]
@@ -344,8 +406,10 @@ def concat_images(image_paths, output_path, direction="auto", order="auto"):
 
     # Detect encoding params from the first input image
     first = image_paths[0]
+    qtables = quality = subsampling = None
+    is_grayscale = False
     if input_formats[0] == "JPEG":
-        qtables, quality, subsampling = _jpeg_params(first)
+        qtables, quality, subsampling, is_grayscale = _jpeg_params(first)
     else:
         qtables, quality, subsampling = None, 85, 2
 
@@ -373,10 +437,17 @@ def concat_images(image_paths, output_path, direction="auto", order="auto"):
 
         out_ext = os.path.splitext(output_path)[1].lower()
         if out_ext in (".jpg", ".jpeg"):
-            if qtables:
-                canvas.save(output_path, "JPEG", qtables=qtables, subsampling=subsampling)
+            # Preserve EXIF from the first source image (in the final arrangement)
+            exif_data = opened[input_formats.index(input_formats[0])].info.get('exif') if input_formats[0] == "JPEG" else None
+
+            save_kwargs = {"exif": exif_data} if exif_data else {}
+            if is_grayscale:
+                canvas = canvas.convert("L")
+                canvas.save(output_path, "JPEG", qtables=qtables, **save_kwargs)
+            elif qtables:
+                canvas.save(output_path, "JPEG", qtables=qtables, subsampling=subsampling, **save_kwargs)
             else:
-                canvas.save(output_path, "JPEG", quality=quality, subsampling=subsampling)
+                canvas.save(output_path, "JPEG", quality=quality, subsampling=subsampling, **save_kwargs)
         else:
             canvas.save(output_path)
 
@@ -400,30 +471,45 @@ def concat_images(image_paths, output_path, direction="auto", order="auto"):
             enc = f"quality≈{quality} (exact source tables)"
         else:
             enc = f"quality={quality}"
-        print(f"\nEncoding: {enc}, subsampling={['4:4:4','4:2:2','4:2:0'][subsampling]}")
+        if is_grayscale:
+            ss_label = "grayscale"
+        else:
+            ss_label = ['4:4:4', '4:2:2', '4:2:0'][subsampling]
+        print(f"\nEncoding: {enc}, subsampling={ss_label}")
     else:
         print(f"\nEncoding: {out_ext.lstrip('.')} (lossless)")
     print(f"Saved: {output_path}")
 
 
-_FORMAT_TO_EXT = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp", "TIFF": ".tiff", "BMP": ".bmp"}
+# ── Legacy helpers (kept for external callers) ────────────────────────────────
+
+_FORMAT_TO_EXT_LEGACY = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp", "TIFF": ".tiff", "BMP": ".bmp"}
 
 def _detect_format(path):
     """Return Pillow format string (e.g. 'JPEG', 'PNG') detected from file bytes."""
     with Image.open(path) as img:
         return img.format
 
+
 def _output_ext(inputs):
-    """Return a common extension if all inputs share the same actual format, else .jpg."""
+    """Return a common extension if all inputs share the same actual format, else .jpg.
+
+    Note: opens each input file. Prefer concat_images() which computes
+    the extension from already-opened images to avoid redundant I/O.
+    """
     fmts = {_detect_format(p) for p in inputs}
     if len(fmts) == 1:
         fmt = fmts.pop()
-        return _FORMAT_TO_EXT.get(fmt, os.path.splitext(inputs[0])[1].lower() or ".jpg")
+        return _FORMAT_TO_EXT_LEGACY.get(fmt, os.path.splitext(inputs[0])[1].lower() or ".jpg")
     return ".jpg"
 
 
 def make_output_path(inputs):
-    """Auto-generate output path next to the first input, with dedup guard."""
+    """Auto-generate output path next to the first input, with dedup guard.
+
+    Note: opens each input file internally. For new code, use concat_images()
+    with output_path=None instead.
+    """
     out_dir = os.path.dirname(os.path.abspath(inputs[0]))
     ext = _output_ext(inputs)
     stem = "concat"
@@ -454,8 +540,9 @@ def main():
         print(f"Error: files not found: {missing}", file=sys.stderr)
         sys.exit(1)
 
-    output = args.output or make_output_path(args.images)
-    concat_images(args.images, output, args.direction, args.order)
+    # Defer output-path computation to concat_images to avoid opening
+    # input files twice (once here for format detection, once for processing).
+    concat_images(args.images, args.output, args.direction, args.order)
 
 
 if __name__ == "__main__":
