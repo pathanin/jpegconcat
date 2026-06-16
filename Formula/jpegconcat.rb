@@ -52,8 +52,8 @@ class Jpegconcat < Formula
     ["pillow", "numpy"].each do |pkg|
       begin
         venv.pip_install resource(pkg)
-      rescue
-        opoo "Pre-built #{pkg} wheel unavailable, building from source (this may take a few minutes)..."
+      rescue => e
+        opoo "Pre-built #{pkg} wheel failed (#{e.class}: #{e.message}), building from source..."
         venv.pip_install resource("#{pkg}-sdist")
       end
     end
