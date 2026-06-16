@@ -50,12 +50,14 @@ class Jpegconcat < Formula
     venv = virtualenv_create(libexec, "python3.12")
 
     ["pillow", "numpy"].each do |pkg|
+      whl_src = resource(pkg).cached_download
+      # Strip Homebrew's hash prefix so pip sees a proper wheel filename,
+      # and copy into buildpath so the install sandbox can read it.
+      wheel_name = whl_src.basename.to_s.sub(/\A[0-9a-f]+-+/, "")
+      whl_dst = buildpath/wheel_name
+      cp whl_src, whl_dst
       begin
-        # Call pip directly with the cached .whl path — venv.pip_install adds
-        # --no-binary=:all: which prevents wheel installs, and also stages the
-        # .whl as an unpacked directory that pip can't install from.
-        system libexec/"bin/pip", "install", "--no-deps", "--no-compile",
-               resource(pkg).cached_download
+        system libexec/"bin/pip", "install", "--no-deps", "--no-compile", whl_dst
       rescue BuildError => e
         opoo "Pre-built #{pkg} wheel failed (#{e.message}), building from source..."
         venv.pip_install resource("#{pkg}-sdist")
