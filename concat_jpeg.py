@@ -110,7 +110,10 @@ def _jpeg_params(path):
                     lb = f.read(2)
                     if len(lb) < 2:
                         break
-                    seg = f.read(struct.unpack(">H", lb)[0] - 2)
+                    seg_len = struct.unpack(">H", lb)[0]
+                    if seg_len < 2:
+                        break
+                    seg = f.read(seg_len - 2)
                     if marker in (0xC0, 0xC1, 0xC2):
                         if len(seg) >= 15 and seg[5] >= 3:
                             y_h,  y_v  = seg[7] >> 4, seg[7] & 0xF
@@ -279,7 +282,10 @@ def _visual_balance(img, direction):
     the "inner" side) goes first — left for horizontal, top for vertical — so
     subjects face inward toward the join seam rather than out toward the edge.
     """
-    arr = np.asarray(img.convert('L'), dtype=np.float32)
+    w, h = img.size
+    scale = max(1, max(w, h) // 128)
+    thumb = img.convert('L').resize((max(1, w // scale), max(1, h // scale)))
+    arr = np.asarray(thumb, dtype=np.float32)
     if direction == "horizontal":
         mid = arr.shape[1] // 2
         return float(arr[:, mid:].mean() - arr[:, :mid].mean())
@@ -377,11 +383,15 @@ def concat_images(image_paths, output_path=None, direction="auto", order="auto")
     """
     opened = [Image.open(p) for p in image_paths]
     input_formats = [img.format for img in opened]
+    _first_exif = opened[0].info.get('exif') if input_formats[0] == "JPEG" else None
 
     if output_path is None:
         output_path = _make_output_path(image_paths, opened)
 
     images = [img.convert("RGB") for img in opened]
+    for _o in opened:
+        _o.close()
+    del opened
 
     preserve_order  = (order != "auto")
     fix_direction = None if direction == "auto" else direction
@@ -454,7 +464,7 @@ def concat_images(image_paths, output_path=None, direction="auto", order="auto")
         out_ext = os.path.splitext(output_path)[1].lower()
         if out_ext in (".jpg", ".jpeg"):
             # Preserve EXIF from the first source image (in the final arrangement)
-            exif_data = opened[0].info.get('exif') if input_formats[0] == "JPEG" else None
+            exif_data = _first_exif
 
             save_kwargs = {"exif": exif_data} if exif_data else {}
             if is_grayscale:
@@ -530,7 +540,7 @@ header {
 }
 h1 { font-size: 1rem; font-weight: 600; letter-spacing: -0.01em; }
 .header-right { display: flex; align-items: center; gap: 12px; }
-#status { font-size: 0.8rem; color: #666; }
+#status { font-size: 0.8rem; color: #999; }
 
 #stitch-btn {
   padding: 7px 16px;
@@ -576,20 +586,8 @@ main {
   background: rgba(37,99,235,0.06);
 }
 #drop-zone svg { flex-shrink: 0; }
-#drop-zone .hint { font-size: 0.75rem; color: #444; }
+#drop-zone .hint { font-size: 0.75rem; color: #888; }
 #file-input { display: none; }
-
-#page-drop-ring {
-  position: fixed;
-  inset: 4px;
-  border: 2px solid #2563eb;
-  border-radius: 8px;
-  pointer-events: none;
-  z-index: 200;
-  opacity: 0;
-  transition: opacity 0.12s;
-}
-body.drag-files-active #page-drop-ring { opacity: 1; }
 
 #grid-outer {
   display: none;
@@ -798,7 +796,7 @@ body.drag-files-active #page-drop-ring { opacity: 1; }
 </header>
 
 <main>
-  <div id="drop-zone">
+  <div id="drop-zone" role="button" tabindex="0" aria-label="Drop images or click to browse">
     <svg width="36" height="36" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24">
       <path stroke-linecap="round" stroke-linejoin="round"
         d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5"/>
@@ -816,8 +814,6 @@ body.drag-files-active #page-drop-ring { opacity: 1; }
     <button id="add-row-btn" title="Add row">+</button>
   </div>
 </main>
-
-<div id="page-drop-ring"></div>
 
 <div id="processing">
   <div class="spinner"></div>
@@ -1007,12 +1003,11 @@ function buildCell(cell, r, c) {
   const toolbar = document.createElement('div');
   toolbar.className = 'cell-toolbar';
   toolbar.innerHTML =
-    '<button class="btn-transform" title="Rotate CCW">↺</button>' +
-    '<button class="btn-transform" title="Rotate CW">↻</button>' +
-    '<div class="toolbar-sep"></div>' +
-    '<button class="btn-transform" title="Flip horizontal">↔</button>' +
-    '<button class="btn-transform" title="Flip vertical">↕</button>';
-  const [rotateCCW, rotateCW, , flipH, flipV] = toolbar.children;
+    '<button class="btn-transform" title="Rotate CCW" aria-label="Rotate counter-clockwise">↺</button>' +
+    '<button class="btn-transform" title="Rotate CW" aria-label="Rotate clockwise">↻</button>' +
+    '<button class="btn-transform" title="Flip horizontal" aria-label="Flip horizontal">↔</button>' +
+    '<button class="btn-transform" title="Flip vertical" aria-label="Flip vertical">↕</button>';
+  const [rotateCCW, rotateCW, flipH, flipV] = toolbar.children;
   rotateCCW.addEventListener('click', e => { e.stopPropagation(); applyTransform(r, c, 'rotate-ccw'); });
   rotateCW .addEventListener('click', e => { e.stopPropagation(); applyTransform(r, c, 'rotate-cw'); });
   flipH    .addEventListener('click', e => { e.stopPropagation(); applyTransform(r, c, 'flip-h'); });
@@ -1056,6 +1051,11 @@ function buildEmptyCell(r, c) {
   el.dataset.c = c;
   el.textContent = '+';
   el.addEventListener('dragover', e => { e.preventDefault(); });
+  el.addEventListener('click', () => {
+    fileInput.dataset.targetR = r;
+    fileInput.dataset.targetC = c;
+    fileInput.click();
+  });
   return el;
 }
 
@@ -1121,14 +1121,12 @@ function updateDropHighlight(clientX, clientY) {
 document.addEventListener('dragenter', e => {
   if (!isFileDrag(e)) return;
   dragEnterCount++;
-  document.body.classList.add('drag-files-active');
 });
 document.addEventListener('dragleave', e => {
   if (!isFileDrag(e)) return;
   dragEnterCount--;
   if (dragEnterCount <= 0) {
     dragEnterCount = 0;
-    document.body.classList.remove('drag-files-active');
     clearAllHighlights();
   }
 });
@@ -1141,7 +1139,6 @@ document.addEventListener('drop', e => {
   if (!e.dataTransfer.files.length) return;
   e.preventDefault();
   dragEnterCount = 0;
-  document.body.classList.remove('drag-files-active');
   clearAllHighlights();
   const target = findNearestZone(e.clientX, e.clientY);
   if (target.type === 'empty') initFromFiles(e.dataTransfer.files);
@@ -1149,13 +1146,22 @@ document.addEventListener('drop', e => {
 });
 document.addEventListener('dragend', () => {
   dragEnterCount = 0;
-  document.body.classList.remove('drag-files-active');
   clearAllHighlights();
 });
 
 dropZoneEl.addEventListener('click', () => fileInput.click());
+dropZoneEl.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fileInput.click(); } });
 fileInput.addEventListener('change', e => {
-  if (e.target.files.length) initFromFiles(e.target.files);
+  if (!e.target.files.length) { fileInput.value = ''; return; }
+  const tr = fileInput.dataset.targetR;
+  const tc = fileInput.dataset.targetC;
+  if (tr !== undefined && tc !== undefined) {
+    dropFilesOnCell(+tr, +tc, 'center', e.target.files);
+    delete fileInput.dataset.targetR;
+    delete fileInput.dataset.targetC;
+  } else {
+    initFromFiles(e.target.files);
+  }
   fileInput.value = '';
 });
 
@@ -1193,15 +1199,15 @@ stitchBtn.addEventListener('click', async () => {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
-    statusEl.textContent = 'Downloaded!';
+    const kb = Math.round(blob.size / 1024);
+    statusEl.textContent = `Downloaded · ${kb} KB`;
     setTimeout(() => {
       const n = imgCount();
       statusEl.textContent = `${n} image${n !== 1 ? 's' : ''} · ${nRows()}×${nCols()} grid`;
     }, 2500);
   } catch (err) {
     console.error(err);
-    statusEl.textContent = 'Error — see console';
-    alert('Stitch failed:\n' + err.message);
+    statusEl.textContent = 'Error: ' + err.message;
   } finally {
     processingEl.classList.remove('visible');
     stitchBtn.disabled = imgCount() < 2;
@@ -1226,48 +1232,43 @@ def _stitch_grid(layout, paths, td):
     Encoding params taken from the first non-None cell (top-left scan order).
     """
     first_path = None
-    grid = []
+    num_rows = len(layout)
+    num_cols = max(len(r) for r in layout)
     for row in layout:
-        img_row = []
-        for fid in row:
-            if fid and fid in paths:
-                img = Image.open(paths[fid]).convert("RGB")
-                img_row.append(img)
-                if first_path is None:
-                    first_path = paths[fid]
-            else:
-                img_row.append(None)
-        grid.append(img_row)
-
-    if first_path is None:
-        return None
-
-    num_rows = len(grid)
-    num_cols = max(len(r) for r in grid)
-    for row in grid:
         while len(row) < num_cols:
             row.append(None)
 
     col_widths  = [0] * num_cols
     row_heights = [0] * num_rows
-    for r, row in enumerate(grid):
-        for c, img in enumerate(row):
-            if img:
-                col_widths[c]  = max(col_widths[c],  img.width)
-                row_heights[r] = max(row_heights[r], img.height)
+    for r, row in enumerate(layout):
+        for c, fid in enumerate(row):
+            if fid and fid in paths:
+                with Image.open(paths[fid]) as _img:
+                    if first_path is None:
+                        first_path = paths[fid]
+                    col_widths[c]  = max(col_widths[c],  _img.width)
+                    row_heights[r] = max(row_heights[r], _img.height)
+
+    if first_path is None:
+        return None
 
     total_w = sum(col_widths)
     total_h = sum(row_heights)
     if total_w == 0 or total_h == 0:
         return None
 
+    MAX_CANVAS_PX = 16384
+    if total_w > MAX_CANVAS_PX or total_h > MAX_CANVAS_PX:
+        return None
+
     canvas = Image.new("RGB", (total_w, total_h), (0, 0, 0))
     y_off = 0
-    for r, row in enumerate(grid):
+    for r, row in enumerate(layout):
         x_off = 0
-        for c, img in enumerate(row):
-            if img:
-                canvas.paste(img, (x_off, y_off))
+        for c, fid in enumerate(row):
+            if fid and fid in paths:
+                with Image.open(paths[fid]) as _img:
+                    canvas.paste(_img.convert("RGB"), (x_off, y_off))
             x_off += col_widths[c]
         y_off += row_heights[r]
 
@@ -1302,6 +1303,7 @@ def _run_web_server(port=5001):
     from flask import Flask, abort, request, send_file
 
     app = Flask(__name__)
+    app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200 MB total upload limit
     # Suppress Flask startup banner
     import logging
     log = logging.getLogger("werkzeug")
@@ -1317,8 +1319,13 @@ def _run_web_server(port=5001):
         if not layout_raw:
             abort(400, "Missing layout")
 
-        layout = _json.loads(layout_raw)
-        layout = [row for row in layout if any(c is not None for c in row)]
+        try:
+            layout = _json.loads(layout_raw)
+            if not isinstance(layout, list):
+                raise ValueError
+            layout = [row for row in layout if isinstance(row, list) and any(c is not None for c in row)]
+        except (ValueError, _json.JSONDecodeError):
+            abort(400, "Invalid layout")
         if not layout:
             abort(400, "Empty layout")
 
@@ -1335,8 +1342,10 @@ def _run_web_server(port=5001):
         with tempfile.TemporaryDirectory() as td:
             paths = {}
             for key, f in request.files.items():
+                safe_key = re.sub(r'[^A-Za-z0-9_-]', '_', key)[:64]
                 ext = os.path.splitext(f.filename)[1] or ".jpg"
-                dest = os.path.join(td, key + ext)
+                ext = re.sub(r'[^A-Za-z0-9.]', '', ext)[:16]
+                dest = os.path.join(td, safe_key + ext)
                 f.save(dest)
                 paths[key] = dest
 
