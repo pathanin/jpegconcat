@@ -46,8 +46,57 @@ class Jpegconcat < Formula
     sha256 "f3a3570c4a2a16746ac2c31a7c7c7b0c186b95ce902e33db6f28094ed7387dda"
   end
 
+  # Flask web UI — pure-Python wheels (py3-none-any, no per-arch blocks needed)
+  resource "blinker" do
+    url "https://files.pythonhosted.org/packages/10/cb/f2ad4230dc2eb1a74edf38f1a38b9b52277f75bef262d8908e60d957e13c/blinker-1.9.0-py3-none-any.whl"
+    sha256 "ba0efaa9080b619ff2f3459d1d500c57bddea4a6b424b60a91141db6fd2f08bc"
+  end
+
+  resource "click" do
+    url "https://files.pythonhosted.org/packages/c7/0d/67e5b4109ea4a837e80daa87c2c696711955e40449a97e8926672534def2/click-8.4.1-py3-none-any.whl"
+    sha256 "482be17c6991b8c19c5429a1e995d9b0efdbb63172824c41f99965dc0ade8ec2"
+  end
+
+  resource "flask" do
+    url "https://files.pythonhosted.org/packages/7f/9c/34f6962f9b9e9c71f6e5ed806e0d0ff03c9d1b0b2340088a0cf4bce09b18/flask-3.1.3-py3-none-any.whl"
+    sha256 "f4bcbefc124291925f1a26446da31a5178f9483862233b23c0c96a20701f670c"
+  end
+
+  resource "itsdangerous" do
+    url "https://files.pythonhosted.org/packages/04/96/92447566d16df59b2a776c0fb82dbc4d9e07cd95062562af01e408583fc4/itsdangerous-2.2.0-py3-none-any.whl"
+    sha256 "c6242fc49e35958c8b15141343aa660db5fc54d4f13a1db01a3f5891b98700ef"
+  end
+
+  resource "jinja2" do
+    url "https://files.pythonhosted.org/packages/62/a1/3d680cbfd5f4b8f15abc1d571870c5fc3e594bb582bc3b64ea099db13e56/jinja2-3.1.6-py3-none-any.whl"
+    sha256 "85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67"
+  end
+
+  resource "markupsafe" do
+    url "https://files.pythonhosted.org/packages/7e/99/7690b6d4034fffd95959cbe0c02de8deb3098cc577c67bb6a24fe5d7caa7/markupsafe-3.0.3.tar.gz"
+    sha256 "722695808f4b6457b320fdc131280796bdceb04ab50fe1795cd540799ebe1698"
+  end
+
+  resource "werkzeug" do
+    url "https://files.pythonhosted.org/packages/93/8c/2e650f2afeb7ee576912636c23ddb621c91ac6a98e66dc8d29c3c69446e1/werkzeug-3.1.8-py3-none-any.whl"
+    sha256 "63a77fb8892bf28ebc3178683445222aa500e48ebad5ec77b0ad80f8726b1f50"
+  end
+
   def install
     venv = virtualenv_create(libexec, "python3.12")
+
+    # Pure-Python Flask deps — install directly from wheel/sdist
+    %w[blinker click itsdangerous jinja2 werkzeug flask].each do |pkg|
+      whl_src = resource(pkg).cached_download
+      wheel_name = whl_src.basename.to_s.sub(/\A[0-9a-f]+-+/, "")
+      whl_dst = buildpath/wheel_name
+      cp whl_src, whl_dst
+      system "python3.12", "-m", "pip",
+             "--python=#{libexec}/bin/python",
+             "install", "--no-deps", "--no-compile", whl_dst
+    end
+    # MarkupSafe has a C extension — build from source
+    venv.pip_install resource("markupsafe")
 
     ["pillow", "numpy"].each do |pkg|
       whl_src = resource(pkg).cached_download
