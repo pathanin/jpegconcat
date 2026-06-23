@@ -220,7 +220,9 @@ def _sort_key(path, img):
     nums = tuple(int(n) for n in re.findall(r"\d+", os.path.basename(path)))
     try: dt = img.getexif().get(0x9003) or ""
     except Exception: dt = ""
-    return (nums, dt, os.path.getmtime(path))
+    try: mtime = os.path.getmtime(path)
+    except OSError: mtime = 0
+    return (nums, dt, mtime)
 
 
 # ── Edge-color seam matching ──────────────────────────────────────────────────
@@ -260,20 +262,41 @@ def _seam_mad(img_a, side_a, img_b, side_b):
     return float(np.mean(np.abs(_edge_strip(img_a, side_a) - _edge_strip(img_b, side_b))))
 
 
+def _visual_balance(img, direction):
+    """
+    Grayscale brightness asymmetry across the image midpoint.
+
+    Horizontal: right_mean - left_mean.  Positive → content heavier on right.
+    Vertical:   bottom_mean - top_mean.  Positive → content heavier on bottom.
+
+    Used to determine layout order: the image with higher score (more content on
+    the "inner" side) goes first — left for horizontal, top for vertical — so
+    subjects face inward toward the join seam rather than out toward the edge.
+    """
+    arr = np.asarray(img.convert('L'), dtype=np.float32)
+    if direction == "horizontal":
+        mid = arr.shape[1] // 2
+        return float(arr[:, mid:].mean() - arr[:, :mid].mean())
+    else:
+        mid = arr.shape[0] // 2
+        return float(arr[mid:, :].mean() - arr[:mid, :].mean())
+
+
 def find_best_arrangement_2(paths, images, preserve_order, fix_direction):
     """
-    For 2 images, determine direction and order:
+    For 2 images, determine direction and order.
 
-    Direction — orientation heuristic (portrait-majority → horizontal), not seam
-    score, because seam matching is unreliable for direction: images with dark or
-    neutral borders produce spuriously low cross-orientation scores.
+    Direction — orientation heuristic (portrait-majority → horizontal). Seam
+    matching is not used for direction because neutral/dark borders produce
+    spuriously low cross-orientation scores.
 
-    Order — seam matching within the chosen direction, but only overrides the
-    as-given (filename) order when the seam-preferred arrangement is at least
-    SEAM_OVERRIDE_RATIO× better. Below that threshold the score difference is
-    more likely noise (same-tone borders) than a meaningful panoramic seam.
+    Order — visual balance: compare how much brightness each image has on its
+    "inner" side (right half for horizontal, bottom half for vertical). The
+    image with more content on that side goes first so subjects face inward.
+    Seam matching overrides this only when one arrangement scores ≥5× better,
+    which indicates a genuine panoramic seam rather than coincidental edge tone.
 
-    preserve_order=True  → skip order test, only determine direction
+    preserve_order=True  → skip order, only determine direction
     fix_direction=str    → use that direction instead of orientation heuristic
     """
     # Direction from orientation heuristic (same logic as the 3+-image fallback)
@@ -287,7 +310,10 @@ def find_best_arrangement_2(paths, images, preserve_order, fix_direction):
     if preserve_order:
         return paths, images, direction
 
-    # Seam scores for both orderings within the chosen direction
+    sep = " | " if direction == "horizontal" else "\n─\n"
+    a, b = os.path.basename(paths[0]), os.path.basename(paths[1])
+
+    # Seam scores — used only for clear panoramic matches (≥5× ratio)
     if direction == "horizontal":
         score_01 = _seam_mad(images[0], "right", images[1], "left")
         score_10 = _seam_mad(images[1], "right", images[0], "left")
@@ -295,24 +321,20 @@ def find_best_arrangement_2(paths, images, preserve_order, fix_direction):
         score_01 = _seam_mad(images[0], "bottom", images[1], "top")
         score_10 = _seam_mad(images[1], "bottom", images[0], "top")
 
-    a, b = os.path.basename(paths[0]), os.path.basename(paths[1])
-    sep = " | " if direction == "horizontal" else "\n─\n"
-
-    # Override as-given order only when seam improvement is substantial
-    SEAM_OVERRIDE_RATIO = 3.0
-    if score_10 < score_01 / SEAM_OVERRIDE_RATIO:
-        best_order = [1, 0]
-        order_note = "seam matching"
+    lo, hi = min(score_01, score_10), max(score_01, score_10)
+    if lo > 0 and hi / lo >= 5.0:
+        # Panoramic seam — clear winner
+        best_order = [0, 1] if score_01 <= score_10 else [1, 0]
+        order_note = "seam matching (panoramic)"
     else:
-        best_order = [0, 1]
-        order_note = "filename order"
+        # Visual balance — image with more content on the inner side goes first
+        b0 = _visual_balance(images[0], direction)
+        b1 = _visual_balance(images[1], direction)
+        best_order = [0, 1] if b0 >= b1 else [1, 0]
+        order_note = f"visual balance ({b0:+.1f} vs {b1:+.1f})"
 
-    marker_01 = " ✓" if best_order == [0, 1] else ""
-    marker_10 = " ✓" if best_order == [1, 0] else ""
-    print(f"Edge seam scores ({direction}, lower = better match):")
-    print(f"  {score_01:6.1f}  [{a}]{sep}[{b}]{marker_01}")
-    print(f"  {score_10:6.1f}  [{b}]{sep}[{a}]{marker_10}")
-    print(f"Order: {order_note}")
+    first, second = best_order
+    print(f"Order: {order_note} → [{os.path.basename(paths[first])}]{sep}[{os.path.basename(paths[second])}]")
 
     return [paths[i] for i in best_order], [images[i] for i in best_order], direction
 
