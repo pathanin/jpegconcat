@@ -79,21 +79,29 @@ main {
 #drop-zone .hint { font-size: 0.75rem; color: #444; }
 #file-input { display: none; }
 
+/* ── Full-page drag ring ─────────────────────────────────────────────────── */
+#page-drop-ring {
+  position: fixed;
+  inset: 4px;
+  border: 2px solid #2563eb;
+  border-radius: 8px;
+  pointer-events: none;
+  z-index: 200;
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+body.drag-files-active #page-drop-ring { opacity: 1; }
+
 /* ── Grid wrapper ────────────────────────────────────────────────────────── */
 #grid-outer {
   display: none;
   flex-direction: column;
   align-items: flex-start;
-  gap: 0;
 }
-
-/* ── Grid ────────────────────────────────────────────────────────────────── */
 #grid-scroll {
   display: flex;
   align-items: flex-start;
-  gap: 0;
 }
-
 #grid {
   display: inline-grid;
   gap: 3px;
@@ -110,8 +118,6 @@ main {
   border-radius: 4px;
   background: #1a1a1a;
   cursor: grab;
-  outline: 2px solid transparent;
-  transition: outline-color 0.1s;
 }
 .cell:active { cursor: grabbing; }
 .cell.dragging { opacity: 0.35; }
@@ -138,6 +144,7 @@ main {
   color: #3a3a3a;
   font-size: 1.3rem;
   cursor: default;
+  transition: border-color 0.1s, color 0.1s, background 0.1s;
 }
 .cell.empty.drag-over-empty {
   border-color: #2563eb;
@@ -152,7 +159,6 @@ main {
   pointer-events: none;
   z-index: 2;
 }
-/* Quadrant highlights appear as semi-transparent strips */
 .drop-overlay .dz {
   position: absolute;
   opacity: 0;
@@ -178,17 +184,60 @@ main {
   border-radius: 4px;
   color: #aaa;
   font-size: 13px;
-  line-height: 1;
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
   opacity: 0;
   transition: opacity 0.12s, background 0.12s, color 0.12s;
-  z-index: 3;
+  z-index: 4;
 }
 .cell:hover .btn-remove { opacity: 1; }
 .btn-remove:hover { background: #dc2626; color: #fff; }
+
+/* ── Cell transform toolbar ──────────────────────────────────────────────── */
+.cell-toolbar {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 26px;
+  background: rgba(0,0,0,0.72);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  opacity: 0;
+  transition: opacity 0.12s;
+  z-index: 4;
+  border-radius: 0 0 4px 4px;
+}
+.cell:hover .cell-toolbar { opacity: 1; }
+
+.btn-transform {
+  width: 24px;
+  height: 22px;
+  background: transparent;
+  border: none;
+  color: #bbb;
+  font-size: 13px;
+  cursor: pointer;
+  border-radius: 3px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.1s, color 0.1s;
+  flex-shrink: 0;
+}
+.btn-transform:hover { background: rgba(255,255,255,0.15); color: #fff; }
+
+.toolbar-sep {
+  width: 1px;
+  height: 14px;
+  background: #444;
+  margin: 0 2px;
+  flex-shrink: 0;
+}
 
 /* ── Add col / add row buttons ───────────────────────────────────────────── */
 #add-col-btn {
@@ -258,18 +307,16 @@ main {
 </header>
 
 <main>
-  <!-- Empty state -->
   <div id="drop-zone">
     <svg width="36" height="36" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24">
       <path stroke-linecap="round" stroke-linejoin="round"
         d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5"/>
     </svg>
-    <span>Drop images here</span>
-    <span class="hint">or click to browse · supports JPEG, PNG, WebP</span>
+    <span>Drop images anywhere</span>
+    <span class="hint">or click to browse · JPEG, PNG, WebP</span>
     <input type="file" id="file-input" accept="image/*" multiple>
   </div>
 
-  <!-- Grid state -->
   <div id="grid-outer">
     <div id="grid-scroll">
       <div id="grid"></div>
@@ -278,6 +325,8 @@ main {
     <button id="add-row-btn" title="Add row">+</button>
   </div>
 </main>
+
+<div id="page-drop-ring"></div>
 
 <div id="processing">
   <div class="spinner"></div>
@@ -290,17 +339,18 @@ main {
 // ── State ──────────────────────────────────────────────────────────────────
 // grid[r][c] = { id, name, file, dataURL } | null
 let grid = [];
-let dragSrc = null; // { r, c } of the cell being dragged
+let dragSrc = null;      // { r, c } when dragging an existing cell
+let dragEnterCount = 0;  // tracks document dragenter/dragleave balance
 
 // ── DOM ────────────────────────────────────────────────────────────────────
-const dropZoneEl  = document.getElementById('drop-zone');
-const fileInput   = document.getElementById('file-input');
-const gridOuter   = document.getElementById('grid-outer');
-const gridEl      = document.getElementById('grid');
-const addColBtn   = document.getElementById('add-col-btn');
-const addRowBtn   = document.getElementById('add-row-btn');
-const stitchBtn   = document.getElementById('stitch-btn');
-const statusEl    = document.getElementById('status');
+const dropZoneEl   = document.getElementById('drop-zone');
+const fileInput    = document.getElementById('file-input');
+const gridOuter    = document.getElementById('grid-outer');
+const gridEl       = document.getElementById('grid');
+const addColBtn    = document.getElementById('add-col-btn');
+const addRowBtn    = document.getElementById('add-row-btn');
+const stitchBtn    = document.getElementById('stitch-btn');
+const statusEl     = document.getElementById('status');
 const processingEl = document.getElementById('processing');
 
 // ── Utility ────────────────────────────────────────────────────────────────
@@ -315,10 +365,14 @@ function readDataURL(file) {
   });
 }
 
-const nRows = () => grid.length;
-const nCols = () => (grid.length ? grid[0].length : 0);
+const nRows     = () => grid.length;
+const nCols     = () => (grid.length ? grid[0].length : 0);
 const hasImages = () => grid.some(row => row.some(Boolean));
-const imageCount = () => grid.reduce((n, r) => n + r.filter(Boolean).length, 0);
+const imgCount  = () => grid.reduce((n, r) => n + r.filter(Boolean).length, 0);
+
+function isFileDrag(e) {
+  return e.dataTransfer && [...e.dataTransfer.types].includes('Files');
+}
 
 // ── Grid mutation helpers ──────────────────────────────────────────────────
 function padGrid() {
@@ -326,17 +380,14 @@ function padGrid() {
   for (const row of grid) while (row.length < cols) row.push(null);
 }
 
-// Insert a new null column AFTER position `after` (-1 inserts before col 0).
 function insertCol(after) {
   for (const row of grid) row.splice(after + 1, 0, null);
 }
 
-// Insert a new null row AFTER position `after` (-1 inserts before row 0).
 function insertRow(after) {
   grid.splice(after + 1, 0, Array(nCols()).fill(null));
 }
 
-// Remove cells at (r, c), then compact: drop fully-null rows, then columns.
 function removeCell(r, c) {
   grid[r][c] = null;
   compact();
@@ -347,12 +398,10 @@ function compact() {
   if (!grid.length) return;
   padGrid();
   const cols = nCols();
-  const deadCols = [];
-  for (let c = 0; c < cols; c++) {
-    if (grid.every(row => !row[c])) deadCols.push(c);
-  }
-  if (deadCols.length) {
-    const keep = new Set(Array.from({length: cols}, (_, i) => i).filter(i => !deadCols.includes(i)));
+  const dead = Array.from({length: cols}, (_, i) => i)
+    .filter(c => grid.every(row => !row[c]));
+  if (dead.length) {
+    const keep = new Set(Array.from({length: cols}, (_, i) => i).filter(i => !dead.includes(i)));
     for (let r = 0; r < grid.length; r++) {
       grid[r] = grid[r].filter((_, i) => keep.has(i));
     }
@@ -363,15 +412,45 @@ function swapCells(r1, c1, r2, c2) {
   [grid[r1][c1], grid[r2][c2]] = [grid[r2][c2], grid[r1][c1]];
 }
 
+// ── Image transform (canvas re-encode) ────────────────────────────────────
+async function applyTransform(r, c, type) {
+  const cell = grid[r][c];
+  if (!cell) return;
+
+  const img = new Image();
+  img.src = cell.dataURL;
+  await new Promise((res, rej) => { img.onload = res; img.onerror = rej; });
+
+  const rotate = type === 'rotate-cw' || type === 'rotate-ccw';
+  const canvas = document.createElement('canvas');
+  canvas.width  = rotate ? img.height : img.width;
+  canvas.height = rotate ? img.width  : img.height;
+  const ctx = canvas.getContext('2d');
+
+  ctx.save();
+  if      (type === 'rotate-cw')  { ctx.translate(canvas.width, 0);          ctx.rotate( Math.PI / 2); }
+  else if (type === 'rotate-ccw') { ctx.translate(0, canvas.height);          ctx.rotate(-Math.PI / 2); }
+  else if (type === 'flip-h')     { ctx.translate(canvas.width, 0);           ctx.scale(-1,  1); }
+  else if (type === 'flip-v')     { ctx.translate(0, canvas.height);          ctx.scale( 1, -1); }
+  ctx.drawImage(img, 0, 0);
+  ctx.restore();
+
+  const newDataURL = canvas.toDataURL('image/jpeg', 0.92);
+  const blob = await new Promise(res => canvas.toBlob(res, 'image/jpeg', 0.92));
+  const newFile = new File([blob], cell.name, { type: 'image/jpeg' });
+
+  grid[r][c] = { ...cell, dataURL: newDataURL, file: newFile };
+  render();
+}
+
 // ── File ingestion ─────────────────────────────────────────────────────────
 async function makeCells(files) {
-  const imgFiles = [...files].filter(f => f.type.startsWith('image/'));
-  return Promise.all(imgFiles.map(async f => ({
+  const imgs = [...files].filter(f => f.type.startsWith('image/'));
+  return Promise.all(imgs.map(async f => ({
     id: uid(), name: f.name, file: f, dataURL: await readDataURL(f),
   })));
 }
 
-// Called when files are dropped onto the empty-state drop zone.
 async function initFromFiles(files) {
   const cells = await makeCells(files);
   if (!cells.length) return;
@@ -379,33 +458,18 @@ async function initFromFiles(files) {
   render();
 }
 
-// Called when files are dropped onto a grid cell's zone.
 async function dropFilesOnCell(r, c, zone, files) {
   const cells = await makeCells(files);
   if (!cells.length) return;
-
   const first = cells[0];
 
   if (zone === 'center') {
     grid[r][c] = first;
-    // Additional files: insert new columns to the right
-    for (let i = 1; i < cells.length; i++) {
-      insertCol(c + i - 1);
-      grid[r][c + i] = cells[i];
-    }
-  } else if (zone === 'right') {
-    insertCol(c);
-    grid[r][c + 1] = first;
-  } else if (zone === 'left') {
-    insertCol(c - 1);    // new column lands at index c
-    grid[r][c] = first;
-  } else if (zone === 'bottom') {
-    insertRow(r);
-    grid[r + 1][c] = first;
-  } else if (zone === 'top') {
-    insertRow(r - 1);    // new row lands at index r
-    grid[r][c] = first;
-  }
+    for (let i = 1; i < cells.length; i++) { insertCol(c + i - 1); grid[r][c + i] = cells[i]; }
+  } else if (zone === 'right')  { insertCol(c);     grid[r][c + 1] = first; }
+  else if   (zone === 'left')   { insertCol(c - 1); grid[r][c]     = first; }
+  else if   (zone === 'bottom') { insertRow(r);     grid[r + 1][c] = first; }
+  else if   (zone === 'top')    { insertRow(r - 1); grid[r][c]     = first; }
 
   render();
 }
@@ -435,7 +499,7 @@ function render() {
     }
   }
 
-  const n = imageCount();
+  const n = imgCount();
   statusEl.textContent = `${n} image${n !== 1 ? 's' : ''} · ${rows}×${cols} grid`;
   stitchBtn.disabled = n < 2;
 }
@@ -445,18 +509,20 @@ function buildCell(cell, r, c) {
   const el = document.createElement('div');
   el.className = 'cell';
   el.draggable = true;
+  el.dataset.r = r;
+  el.dataset.c = c;
 
   const img = document.createElement('img');
   img.src = cell.dataURL;
   img.alt = cell.name;
   el.appendChild(img);
 
-  // Drop overlay (zone highlights)
+  // Zone overlay (shown during drags)
   const overlay = document.createElement('div');
   overlay.className = 'drop-overlay';
-  for (const zone of ['center','left','right','top','bottom']) {
+  for (const z of ['center','left','right','top','bottom']) {
     const dz = document.createElement('div');
-    dz.className = `dz dz-${zone}`;
+    dz.className = `dz dz-${z}`;
     overlay.appendChild(dz);
   }
   el.appendChild(overlay);
@@ -469,7 +535,23 @@ function buildCell(cell, r, c) {
   rmBtn.addEventListener('click', e => { e.stopPropagation(); removeCell(r, c); render(); });
   el.appendChild(rmBtn);
 
-  // ── Drag source events
+  // Transform toolbar
+  const toolbar = document.createElement('div');
+  toolbar.className = 'cell-toolbar';
+  toolbar.innerHTML =
+    '<button class="btn-transform" title="Rotate CCW">↺</button>' +
+    '<button class="btn-transform" title="Rotate CW">↻</button>' +
+    '<div class="toolbar-sep"></div>' +
+    '<button class="btn-transform" title="Flip horizontal">↔</button>' +
+    '<button class="btn-transform" title="Flip vertical">↕</button>';
+  const [rotateCCW, rotateCW, , flipH, flipV] = toolbar.children;
+  rotateCCW.addEventListener('click', e => { e.stopPropagation(); applyTransform(r, c, 'rotate-ccw'); });
+  rotateCW .addEventListener('click', e => { e.stopPropagation(); applyTransform(r, c, 'rotate-cw'); });
+  flipH    .addEventListener('click', e => { e.stopPropagation(); applyTransform(r, c, 'flip-h'); });
+  flipV    .addEventListener('click', e => { e.stopPropagation(); applyTransform(r, c, 'flip-v'); });
+  el.appendChild(toolbar);
+
+  // ── Cell-drag source
   el.addEventListener('dragstart', e => {
     dragSrc = { r, c };
     e.dataTransfer.effectAllowed = 'move';
@@ -479,23 +561,24 @@ function buildCell(cell, r, c) {
   el.addEventListener('dragend', () => {
     el.classList.remove('dragging');
     dragSrc = null;
-    clearZones();
+    clearAllHighlights();
   });
 
-  // ── Drop target events
+  // ── Cell-drag target (swap highlight only; file drops go via document)
   el.addEventListener('dragover', e => {
     e.preventDefault();
-    e.dataTransfer.dropEffect = 'move';
-    activateZone(overlay, getZone(e, el));
+    if (dragSrc) activateZone(overlay, zoneAt(e.clientX, e.clientY, el));
   });
   el.addEventListener('dragleave', e => {
-    if (!el.contains(e.relatedTarget)) clearZones(overlay);
+    if (dragSrc && !el.contains(e.relatedTarget)) deactivateZone(overlay);
   });
   el.addEventListener('drop', e => {
     e.preventDefault();
-    const zone = getZone(e, el);
-    clearZones();
-    handleDrop(e, r, c, zone);
+    deactivateZone(overlay);
+    if (e.dataTransfer.files.length) return; // document handler takes this
+    if (!dragSrc) return;
+    const { r: sr, c: sc } = dragSrc;
+    if (sr !== r || sc !== c) { swapCells(sr, sc, r, c); render(); }
   });
 
   return el;
@@ -504,32 +587,27 @@ function buildCell(cell, r, c) {
 function buildEmptyCell(r, c) {
   const el = document.createElement('div');
   el.className = 'cell empty';
+  el.dataset.r = r;
+  el.dataset.c = c;
   el.textContent = '+';
 
-  el.addEventListener('dragover', e => {
-    e.preventDefault();
-    el.classList.add('drag-over-empty');
-  });
-  el.addEventListener('dragleave', () => el.classList.remove('drag-over-empty'));
-  el.addEventListener('drop', e => {
-    e.preventDefault();
-    el.classList.remove('drag-over-empty');
-    handleDrop(e, r, c, 'center');
-  });
+  // Only needed so the browser shows the right cursor and accepts the drop;
+  // actual routing happens in the document-level drop handler.
+  el.addEventListener('dragover', e => { e.preventDefault(); });
 
   return el;
 }
 
 // ── Zone helpers ────────────────────────────────────────────────────────────
-function getZone(e, el) {
+function zoneAt(clientX, clientY, el) {
   const rect = el.getBoundingClientRect();
-  const x = (e.clientX - rect.left) / rect.width;
-  const y = (e.clientY - rect.top)  / rect.height;
-  const EDGE = 0.28;
-  if (x < EDGE)     return 'left';
-  if (x > 1 - EDGE) return 'right';
-  if (y < EDGE)     return 'top';
-  if (y > 1 - EDGE) return 'bottom';
+  const x = (clientX - rect.left) / rect.width;
+  const y = (clientY - rect.top)  / rect.height;
+  const E = 0.28;
+  if (x < E)     return 'left';
+  if (x > 1 - E) return 'right';
+  if (y < E)     return 'top';
+  if (y > 1 - E) return 'bottom';
   return 'center';
 }
 
@@ -539,84 +617,119 @@ function activateZone(overlay, zone) {
   }
 }
 
-function clearZones(overlay) {
-  const root = overlay || document;
-  root.querySelectorAll('.dz.active').forEach(el => el.classList.remove('active'));
+function deactivateZone(overlay) {
+  overlay.querySelectorAll('.dz.active').forEach(d => d.classList.remove('active'));
 }
 
-// ── Drop dispatch ───────────────────────────────────────────────────────────
-async function handleDrop(e, r, c, zone) {
-  // Files from the filesystem take priority
-  if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-    await dropFilesOnCell(r, c, zone, e.dataTransfer.files);
+function clearAllHighlights() {
+  document.querySelectorAll('.dz.active').forEach(d => d.classList.remove('active'));
+  document.querySelectorAll('.cell.empty.drag-over-empty')
+    .forEach(d => d.classList.remove('drag-over-empty'));
+  dropZoneEl.classList.remove('drag-over');
+}
+
+// ── Nearest-zone finder (for full-page drop routing) ─────────────────────
+function findNearestZone(clientX, clientY) {
+  if (!hasImages()) return { type: 'empty' };
+
+  const allCells = document.querySelectorAll('.cell[data-r][data-c]');
+  if (!allCells.length) return { type: 'empty' };
+
+  // Distance from point to nearest edge of a rect (0 if inside)
+  function distToRect(rect) {
+    const dx = Math.max(0, rect.left - clientX, clientX - rect.right);
+    const dy = Math.max(0, rect.top  - clientY, clientY - rect.bottom);
+    return Math.hypot(dx, dy);
+  }
+
+  let nearest = null, minDist = Infinity;
+  for (const el of allCells) {
+    const rect = el.getBoundingClientRect();
+    const d = distToRect(rect);
+    if (d < minDist) { minDist = d; nearest = { el, rect }; }
+  }
+
+  const r = +nearest.el.dataset.r;
+  const c = +nearest.el.dataset.c;
+
+  if (nearest.el.classList.contains('empty')) {
+    return { type: 'cell', r, c, zone: 'center', el: nearest.el };
+  }
+  return { type: 'cell', r, c, zone: zoneAt(clientX, clientY, nearest.el), el: nearest.el };
+}
+
+function updateDropHighlight(clientX, clientY) {
+  clearAllHighlights();
+  const target = findNearestZone(clientX, clientY);
+  if (target.type === 'empty') {
+    dropZoneEl.classList.add('drag-over');
     return;
   }
-
-  // Existing cell drag → swap (only when dropped on center)
-  if (dragSrc) {
-    const { r: sr, c: sc } = dragSrc;
-    if (sr === r && sc === c) return;
-    if (zone === 'center') {
-      swapCells(sr, sc, r, c);
-    } else {
-      // Treat non-center as swap for existing-cell drags (simpler UX)
-      swapCells(sr, sc, r, c);
-    }
-    render();
+  if (target.el.classList.contains('empty')) {
+    target.el.classList.add('drag-over-empty');
+  } else {
+    const overlay = target.el.querySelector('.drop-overlay');
+    if (overlay) activateZone(overlay, target.zone);
   }
 }
 
-// ── Upload (empty state) ────────────────────────────────────────────────────
+// ── Document-level drag handlers (full-page drop) ─────────────────────────
+document.addEventListener('dragenter', e => {
+  if (!isFileDrag(e)) return;
+  dragEnterCount++;
+  document.body.classList.add('drag-files-active');
+});
+
+document.addEventListener('dragleave', e => {
+  if (!isFileDrag(e)) return;
+  dragEnterCount--;
+  if (dragEnterCount <= 0) {
+    dragEnterCount = 0;
+    document.body.classList.remove('drag-files-active');
+    clearAllHighlights();
+  }
+});
+
+document.addEventListener('dragover', e => {
+  if (!isFileDrag(e)) return;
+  e.preventDefault();
+  updateDropHighlight(e.clientX, e.clientY);
+});
+
+document.addEventListener('drop', e => {
+  if (!e.dataTransfer.files.length) return;
+  e.preventDefault();
+  dragEnterCount = 0;
+  document.body.classList.remove('drag-files-active');
+  clearAllHighlights();
+
+  const target = findNearestZone(e.clientX, e.clientY);
+  if (target.type === 'empty') {
+    initFromFiles(e.dataTransfer.files);
+  } else {
+    dropFilesOnCell(target.r, target.c, target.zone, e.dataTransfer.files);
+  }
+});
+
+// Safety reset if drag is cancelled (e.g. Esc key)
+document.addEventListener('dragend', () => {
+  dragEnterCount = 0;
+  document.body.classList.remove('drag-files-active');
+  clearAllHighlights();
+});
+
+// ── File browse (click) ──────────────────────────────────────────────────
 dropZoneEl.addEventListener('click', () => fileInput.click());
 fileInput.addEventListener('change', e => {
   if (e.target.files.length) initFromFiles(e.target.files);
   fileInput.value = '';
 });
-dropZoneEl.addEventListener('dragover', e => {
-  e.preventDefault();
-  dropZoneEl.classList.add('drag-over');
-});
-dropZoneEl.addEventListener('dragleave', () => dropZoneEl.classList.remove('drag-over'));
-dropZoneEl.addEventListener('drop', e => {
-  e.preventDefault();
-  dropZoneEl.classList.remove('drag-over');
-  if (e.dataTransfer.files.length) initFromFiles(e.dataTransfer.files);
-});
 
-// ── Add col / row ────────────────────────────────────────────────────────────
+// ── Add col / row buttons ────────────────────────────────────────────────
 addColBtn.addEventListener('click', () => { if (hasImages()) { insertCol(nCols() - 1); render(); } });
 addRowBtn.addEventListener('click', () => { if (hasImages()) { insertRow(nRows() - 1); render(); } });
 
-// Allow dropping files onto add-col / add-row buttons
-addColBtn.addEventListener('dragover', e => { e.preventDefault(); addColBtn.style.background = '#1d4ed8'; });
-addColBtn.addEventListener('dragleave', () => { addColBtn.style.background = ''; });
-addColBtn.addEventListener('drop', async e => {
-  e.preventDefault();
-  addColBtn.style.background = '';
-  if (!e.dataTransfer.files.length) return;
-  const cells = await makeCells(e.dataTransfer.files);
-  if (!cells.length) return;
-  insertCol(nCols() - 1);
-  const c = nCols() - 1;
-  grid[0][c] = cells[0];
-  render();
-});
-
-addRowBtn.addEventListener('dragover', e => { e.preventDefault(); addRowBtn.style.background = '#1d4ed8'; });
-addRowBtn.addEventListener('dragleave', () => { addRowBtn.style.background = ''; });
-addRowBtn.addEventListener('drop', async e => {
-  e.preventDefault();
-  addRowBtn.style.background = '';
-  if (!e.dataTransfer.files.length) return;
-  const cells = await makeCells(e.dataTransfer.files);
-  if (!cells.length) return;
-  insertRow(nRows() - 1);
-  const r = nRows() - 1;
-  grid[r][0] = cells[0];
-  render();
-});
-
-// ── Stitch & download ────────────────────────────────────────────────────────
+// ── Stitch & download ────────────────────────────────────────────────────
 stitchBtn.addEventListener('click', async () => {
   if (!hasImages()) return;
 
@@ -656,7 +769,7 @@ stitchBtn.addEventListener('click', async () => {
 
     statusEl.textContent = 'Downloaded!';
     setTimeout(() => {
-      const n = imageCount();
+      const n = imgCount();
       statusEl.textContent = `${n} image${n !== 1 ? 's' : ''} · ${nRows()}×${nCols()} grid`;
     }, 2500);
   } catch (err) {
@@ -665,7 +778,7 @@ stitchBtn.addEventListener('click', async () => {
     alert('Stitch failed:\n' + err.message);
   } finally {
     processingEl.classList.remove('visible');
-    stitchBtn.disabled = imageCount() < 2;
+    stitchBtn.disabled = imgCount() < 2;
   }
 });
 </script>
