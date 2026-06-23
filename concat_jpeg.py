@@ -262,38 +262,59 @@ def _seam_mad(img_a, side_a, img_b, side_b):
 
 def find_best_arrangement_2(paths, images, preserve_order, fix_direction):
     """
-    Try every allowed seam connection for 2 images and return
-    (ordered_paths, ordered_images, direction) for the best match.
+    For 2 images, determine direction and order:
 
-    preserve_order=True     → keep as-given order, only test directions
-    fix_direction=str  → keep that direction, only test orderings
+    Direction — orientation heuristic (portrait-majority → horizontal), not seam
+    score, because seam matching is unreliable for direction: images with dark or
+    neutral borders produce spuriously low cross-orientation scores.
+
+    Order — seam matching within the chosen direction, but only overrides the
+    as-given (filename) order when the seam-preferred arrangement is at least
+    SEAM_OVERRIDE_RATIO× better. Below that threshold the score difference is
+    more likely noise (same-tone borders) than a meaningful panoramic seam.
+
+    preserve_order=True  → skip order test, only determine direction
+    fix_direction=str    → use that direction instead of orientation heuristic
     """
-    orders     = [[0, 1]] if preserve_order else [[0, 1], [1, 0]]
-    directions = [fix_direction] if fix_direction else ["horizontal", "vertical"]
+    # Direction from orientation heuristic (same logic as the 3+-image fallback)
+    if fix_direction:
+        direction = fix_direction
+    else:
+        portrait_count = sum(1 for img in images if img.height >= img.width)
+        direction = "horizontal" if portrait_count * 2 >= len(images) else "vertical"
+    print(f"Direction: orientation heuristic → {direction}")
 
-    candidates = []
-    for order in orders:
-        for direction in directions:
-            if direction == "horizontal":
-                score = _seam_mad(images[order[0]], "right", images[order[1]], "left")
-            else:
-                score = _seam_mad(images[order[0]], "bottom", images[order[1]], "top")
-            a = os.path.basename(paths[order[0]])
-            b = os.path.basename(paths[order[1]])
-            sep = " | " if direction == "horizontal" else "\n─\n"
-            label = f"[{a}]{sep}[{b}] ({direction})"
-            candidates.append((score, order, direction, label))
+    if preserve_order:
+        return paths, images, direction
 
-    candidates.sort(key=lambda x: x[0])
-    best_score = candidates[0][0]
+    # Seam scores for both orderings within the chosen direction
+    if direction == "horizontal":
+        score_01 = _seam_mad(images[0], "right", images[1], "left")
+        score_10 = _seam_mad(images[1], "right", images[0], "left")
+    else:
+        score_01 = _seam_mad(images[0], "bottom", images[1], "top")
+        score_10 = _seam_mad(images[1], "bottom", images[0], "top")
 
-    print("Edge seam scores (lower = better match):")
-    for score, _, _, label in candidates:
-        marker = " ✓" if score == best_score else ""
-        print(f"  {score:6.1f}  {label}{marker}")
+    a, b = os.path.basename(paths[0]), os.path.basename(paths[1])
+    sep = " | " if direction == "horizontal" else "\n─\n"
 
-    _, best_order, best_direction, _ = candidates[0]
-    return [paths[i] for i in best_order], [images[i] for i in best_order], best_direction
+    # Override as-given order only when seam improvement is substantial
+    SEAM_OVERRIDE_RATIO = 3.0
+    if score_10 < score_01 / SEAM_OVERRIDE_RATIO:
+        best_order = [1, 0]
+        order_note = "seam matching"
+    else:
+        best_order = [0, 1]
+        order_note = "filename order"
+
+    marker_01 = " ✓" if best_order == [0, 1] else ""
+    marker_10 = " ✓" if best_order == [1, 0] else ""
+    print(f"Edge seam scores ({direction}, lower = better match):")
+    print(f"  {score_01:6.1f}  [{a}]{sep}[{b}]{marker_01}")
+    print(f"  {score_10:6.1f}  [{b}]{sep}[{a}]{marker_10}")
+    print(f"Order: {order_note}")
+
+    return [paths[i] for i in best_order], [images[i] for i in best_order], direction
 
 
 _FORMAT_TO_EXT = {
@@ -344,7 +365,6 @@ def concat_images(image_paths, output_path=None, direction="auto", order="auto")
     )
 
     if use_edge_match:
-        print("Order + direction: edge-color seam matching")
         image_paths, images, direction = find_best_arrangement_2(
             image_paths, images, preserve_order=preserve_order, fix_direction=fix_direction
         )
@@ -455,11 +475,19 @@ def main():
         description="Concatenate JPEG images preserving encoding params.",
         usage="%(prog)s img1.jpg img2.jpg [img3.jpg ...] [--output out.jpg] [--direction h|v|auto] [--order auto|as-given]",
     )
+    _DIR_ALIASES = {"h": "horizontal", "v": "vertical", "a": "auto"}
+
     parser.add_argument("images",      nargs="+", help="Input image paths")
-    parser.add_argument("--output",    default=None, help="Output path (auto-generated if omitted)")
-    parser.add_argument("--direction", choices=["horizontal", "vertical", "auto"], default="auto")
+    parser.add_argument("--output", "-o", default=None, help="Output path (auto-generated if omitted)")
+    parser.add_argument("--direction", "-d",
+                        choices=["horizontal", "vertical", "auto", "h", "v", "a"],
+                        default="auto",
+                        metavar="{horizontal|h, vertical|v, auto|a}",
+                        help="Layout direction (default: auto)")
     parser.add_argument("--order",     choices=["auto", "as-given"],               default="auto")
     args = parser.parse_args()
+
+    direction = _DIR_ALIASES.get(args.direction, args.direction)
 
     missing = [p for p in args.images if not os.path.exists(p)]
     if missing:
@@ -468,7 +496,7 @@ def main():
 
     # Defer output-path computation to concat_images to avoid opening
     # input files twice (once here for format detection, once for processing).
-    concat_images(args.images, args.output, args.direction, args.order)
+    concat_images(args.images, args.output, direction, args.order)
 
 
 if __name__ == "__main__":
