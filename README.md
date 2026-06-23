@@ -5,6 +5,8 @@ so the output file size stays close to the sum of the inputs.
 For 2 images, it auto-detects the correct order and orientation by matching
 edge colors — no need to specify anything.
 
+Also ships a **drag-and-drop browser UI** — run `jpegconcat --web` to open it.
+
 ---
 
 ## Install
@@ -25,16 +27,45 @@ jpegconcat photo1.jpg photo2.jpg
 **Manually (requires Python 3):**
 
 ```
-pip3 install Pillow numpy
+pip3 install Pillow numpy flask
 python3 concat_jpeg.py photo1.jpg photo2.jpg
 ```
 
 ---
 
-## Usage
+## Browser UI
 
 ```
-python3 concat_jpeg.py photo1.jpg photo2.jpg
+jpegconcat --web
+```
+
+Opens a drag-and-drop interface at `http://localhost:5001`. Drop images anywhere
+on the page to build a grid, then click **Stitch & Download**.
+
+**Grid building:**
+- Drop an image onto the **left or right edge** of a cell → inserts a new column
+- Drop onto the **top or bottom edge** → inserts a new row
+- Drop onto the **center** of a cell → replaces that image
+- Drag one cell onto another → **swap** them
+- Click **×** on a cell → removes it (grid compacts automatically)
+- Click **+** on the right or bottom border → adds an empty column/row
+
+**Per-image transforms (hover any cell):**
+- **↺ ↻** — rotate 90° counter-clockwise / clockwise
+- **↔ ↕** — flip horizontal / vertical
+
+**Custom port:**
+
+```
+jpegconcat --web --port 8080
+```
+
+---
+
+## CLI usage
+
+```
+jpegconcat photo1.jpg photo2.jpg
 ```
 
 Output is saved as `concat.jpg` in the same folder as your images.
@@ -43,16 +74,16 @@ If `concat.jpg` already exists, it saves as `concat_2.jpg`, `concat_3.jpg`, etc.
 **Override layout or order if needed:**
 
 ```
-python3 concat_jpeg.py a.jpg b.jpg --direction horizontal   # force side-by-side
-python3 concat_jpeg.py a.jpg b.jpg --direction vertical     # force top/bottom
-python3 concat_jpeg.py a.jpg b.jpg --order as-given         # keep the order you typed
-python3 concat_jpeg.py a.jpg b.jpg --output my_name.jpg     # custom output path
+jpegconcat a.jpg b.jpg --direction horizontal   # force side-by-side
+jpegconcat a.jpg b.jpg --direction vertical     # force top/bottom
+jpegconcat a.jpg b.jpg --order as-given         # keep the order you typed
+jpegconcat a.jpg b.jpg --output my_name.jpg     # custom output path
 ```
 
 **More than 2 images:**
 
 ```
-python3 concat_jpeg.py a.jpg b.jpg c.jpg
+jpegconcat a.jpg b.jpg c.jpg
 ```
 
 ---
