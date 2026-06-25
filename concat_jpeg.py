@@ -600,9 +600,10 @@ body {
   font-family: system-ui, -apple-system, sans-serif;
   background: #111;
   color: #e2e2e2;
-  min-height: 100vh;
+  height: 100dvh;
   display: flex;
   flex-direction: column;
+  overflow: hidden;
 }
 
 header {
@@ -632,21 +633,61 @@ h1 { font-size: 1rem; font-weight: 600; letter-spacing: -0.01em; }
 #stitch-btn:hover:not(:disabled) { background: #1d4ed8; }
 #stitch-btn:disabled { background: #2a2a2a; color: #555; cursor: default; }
 
-#preview-area {
+#app-body {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+  min-height: 0;
+}
+#app-body.layout-side  { flex-direction: row; }
+#app-body.layout-stack { flex-direction: column; }
+
+#editor-pane {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 28px;
+  overflow: auto;
+  flex-shrink: 0;
+}
+#app-body.has-preview.layout-side  #editor-pane { max-width: 42%; }
+#app-body.has-preview.layout-stack #editor-pane { max-height: 42%; }
+#app-body:not(.has-preview) #editor-pane { flex: 1; }
+
+#preview-pane {
   display: none;
-  margin: 16px 32px 24px;
-  text-align: center;
+  flex: 1;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 16px;
+  min-width: 0;
+  min-height: 0;
+  border-left: 1px solid #2a2a2a;
+}
+#app-body.has-preview #preview-pane { display: flex; }
+#app-body.layout-stack #preview-pane { border-left: none; border-top: 1px solid #2a2a2a; }
+
+#preview-img-wrap {
+  flex: 1;
+  align-self: stretch;
+  min-height: 0;
+  min-width: 0;
+  position: relative;
 }
 #preview-img {
-  max-width: 100%;
-  max-height: 60vh;
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
   border: 1px solid #333;
   border-radius: 6px;
   background: #111;
 }
 #download-btn {
   display: inline-block;
-  margin-top: 10px;
   padding: 7px 18px;
   background: #16a34a;
   color: #fff;
@@ -657,21 +698,11 @@ h1 { font-size: 1rem; font-weight: 600; letter-spacing: -0.01em; }
   cursor: pointer;
   text-decoration: none;
   transition: background 0.12s;
+  flex-shrink: 0;
 }
 #download-btn:hover { background: #15803d; }
 
-main {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 32px;
-  overflow: auto;
-}
-
 #drop-zone {
-  width: 380px;
-  height: 260px;
   border: 2px dashed #333;
   border-radius: 12px;
   display: flex;
@@ -683,6 +714,24 @@ main {
   cursor: pointer;
   transition: border-color 0.15s, color 0.15s, background 0.15s;
   user-select: none;
+  min-width: 300px;
+  min-height: 200px;
+}
+/* no-preview: editor fills viewport — drop zone and grid fill it too */
+#app-body:not(.has-preview) #editor-pane {
+  align-items: stretch;
+  justify-content: flex-start;
+}
+#app-body:not(.has-preview) #drop-zone {
+  flex: 1;
+}
+#app-body:not(.has-preview) #grid-outer {
+  flex: 1;
+  overflow: auto;
+}
+#app-body:not(.has-preview) .cell img {
+  max-width: 320px;
+  max-height: 320px;
 }
 #drop-zone.drag-over {
   border-color: #2563eb;
@@ -696,11 +745,13 @@ main {
 #grid-outer {
   display: none;
   flex-direction: column;
-  align-items: flex-start;
+  align-items: center;
+  gap: 6px;
 }
 #grid-scroll {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
+  gap: 6px;
 }
 #grid {
   display: inline-grid;
@@ -732,8 +783,8 @@ main {
 }
 
 .cell.empty {
-  width: 72px;
-  height: 72px;
+  min-width: 80px;
+  min-height: 80px;
   border: 2px dashed #2a2a2a;
   background: #181818;
   display: flex;
@@ -834,10 +885,7 @@ main {
   flex-shrink: 0;
 }
 
-#add-col-btn {
-  width: 22px;
-  align-self: stretch;
-  margin-left: 4px;
+.add-btn {
   background: #1c1c1c;
   border: 1px dashed #2a2a2a;
   border-radius: 6px;
@@ -847,21 +895,25 @@ main {
   transition: background 0.12s, color 0.12s, border-color 0.12s;
   flex-shrink: 0;
 }
-#add-col-btn:hover { background: #2563eb; color: #fff; border-color: #2563eb; }
+.add-btn:hover { background: #2563eb; color: #fff; border-color: #2563eb; }
 
-#add-row-btn {
-  height: 22px;
-  margin-top: 4px;
-  background: #1c1c1c;
-  border: 1px dashed #2a2a2a;
-  border-radius: 6px;
-  color: #3a3a3a;
-  font-size: 1rem;
-  cursor: pointer;
-  transition: background 0.12s, color 0.12s, border-color 0.12s;
+#add-left-btn {
+  width: 22px;
   align-self: stretch;
 }
-#add-row-btn:hover { background: #2563eb; color: #fff; border-color: #2563eb; }
+
+#add-right-btn {
+  width: 22px;
+  align-self: stretch;
+}
+
+#add-top-btn {
+  height: 22px;
+}
+
+#add-bottom-btn {
+  height: 22px;
+}
 
 #processing {
   display: none;
@@ -902,30 +954,35 @@ main {
   </div>
 </header>
 
-<main>
-  <div id="drop-zone" role="button" tabindex="0" aria-label="Drop images or click to browse">
-    <svg width="36" height="36" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24">
-      <path stroke-linecap="round" stroke-linejoin="round"
-        d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5"/>
-    </svg>
-    <span>Drop images anywhere</span>
-    <span class="hint">or click to browse &middot; JPEG, PNG, WebP</span>
-    <input type="file" id="file-input" accept="image/*" multiple>
-  </div>
-
-  <div id="grid-outer">
-    <div id="grid-scroll">
-      <div id="grid"></div>
-      <button id="add-col-btn" title="Add column">+</button>
+<div id="app-body">
+  <div id="editor-pane">
+    <div id="drop-zone" role="button" tabindex="0" aria-label="Drop images or click to browse">
+      <svg width="36" height="36" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round"
+          d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5"/>
+      </svg>
+      <span>Drop images anywhere</span>
+      <span class="hint">or click to browse &middot; JPEG, PNG, WebP</span>
+      <input type="file" id="file-input" accept="image/*" multiple>
     </div>
-    <button id="add-row-btn" title="Add row">+</button>
-  </div>
-</main>
 
-<div id="preview-area">
-  <img id="preview-img" alt="Stitched preview">
-  <br>
-  <a id="download-btn" download="stitched.jpg">Download</a>
+    <div id="grid-outer">
+      <button id="add-top-btn" class="add-btn" title="Add row above">+</button>
+      <div id="grid-scroll">
+        <button id="add-left-btn" class="add-btn" title="Add column before">+</button>
+        <div id="grid"></div>
+        <button id="add-right-btn" class="add-btn" title="Add column after">+</button>
+      </div>
+      <button id="add-bottom-btn" class="add-btn" title="Add row below">+</button>
+    </div>
+  </div>
+
+  <div id="preview-pane">
+    <div id="preview-img-wrap">
+      <img id="preview-img" alt="Stitched preview">
+    </div>
+    <a id="download-btn" download="stitched.jpg">Download</a>
+  </div>
 </div>
 
 <div id="processing">
@@ -939,29 +996,35 @@ main {
 let grid = [];
 let dragSrc = null;
 let dragEnterCount = 0;
+let _rafPending = false;
+let _lastDragX = 0, _lastDragY = 0;
 
+const appBody      = document.getElementById('app-body');
 const dropZoneEl   = document.getElementById('drop-zone');
 const fileInput    = document.getElementById('file-input');
 const gridOuter    = document.getElementById('grid-outer');
 const gridEl       = document.getElementById('grid');
-const addColBtn    = document.getElementById('add-col-btn');
-const addRowBtn    = document.getElementById('add-row-btn');
+const addLeftBtn   = document.getElementById('add-left-btn');
+const addRightBtn  = document.getElementById('add-right-btn');
+const addTopBtn    = document.getElementById('add-top-btn');
+const addBottomBtn = document.getElementById('add-bottom-btn');
 const stitchBtn    = document.getElementById('stitch-btn');
 const statusEl     = document.getElementById('status');
 const processingEl = document.getElementById('processing');
-const previewArea  = document.getElementById('preview-area');
 const previewImg   = document.getElementById('preview-img');
 const downloadBtn  = document.getElementById('download-btn');
 
 const uid = () => Math.random().toString(36).slice(2, 9);
 
-function readDataURL(file) {
-  return new Promise((res, rej) => {
-    const r = new FileReader();
-    r.onload = e => res(e.target.result);
-    r.onerror = rej;
-    r.readAsDataURL(file);
-  });
+async function makeThumbnail(file, maxPx = 400) {
+  const bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' });
+  const scale = Math.min(1, maxPx / Math.max(bitmap.width, bitmap.height));
+  const w = Math.max(1, Math.round(bitmap.width * scale));
+  const h = Math.max(1, Math.round(bitmap.height * scale));
+  const cv = Object.assign(document.createElement('canvas'), { width: w, height: h });
+  cv.getContext('2d').drawImage(bitmap, 0, 0, w, h);
+  bitmap.close();
+  return cv.toDataURL('image/jpeg', 0.75);
 }
 
 const nRows     = () => grid.length;
@@ -1010,12 +1073,32 @@ function swapCells(r1, c1, r2, c2) {
   [grid[r1][c1], grid[r2][c2]] = [grid[r2][c2], grid[r1][c1]];
 }
 
+function moveCellToZone(srcR, srcC, dstR, dstC, zone) {
+  if (zone === 'center') { swapCells(srcR, srcC, dstR, dstC); return; }
+  const srcCell = grid[srcR][srcC];
+  const dstCell = grid[dstR][dstC];
+  grid[srcR][srcC] = null;
+  compact();
+  // Re-locate dstCell after compact may have shifted indices
+  let nr = -1, nc = -1;
+  outer: for (let r = 0; r < grid.length; r++)
+    for (let c = 0; c < grid[r].length; c++)
+      if (grid[r][c] === dstCell) { nr = r; nc = c; break outer; }
+  if (nr === -1) { grid.push([srcCell]); return; }
+  if (zone === 'left')   { insertCol(nc - 1); grid[nr][nc]     = srcCell; }
+  else if (zone === 'right')  { insertCol(nc);     grid[nr][nc + 1] = srcCell; }
+  else if (zone === 'top')    { insertRow(nr - 1); grid[nr][nc]     = srcCell; }
+  else if (zone === 'bottom') { insertRow(nr);     grid[nr + 1][nc] = srcCell; }
+}
+
 async function applyTransform(r, c, type) {
   const cell = grid[r][c];
   if (!cell) return;
+  const objURL = URL.createObjectURL(cell.file);
   const img = new Image();
-  img.src = cell.dataURL;
+  img.src = objURL;
   await new Promise((res, rej) => { img.onload = res; img.onerror = rej; });
+  URL.revokeObjectURL(objURL);
   const rotate = type === 'rotate-cw' || type === 'rotate-ccw';
   const canvas = document.createElement('canvas');
   canvas.width  = rotate ? img.height : img.width;
@@ -1028,17 +1111,17 @@ async function applyTransform(r, c, type) {
   else if (type === 'flip-v')     { ctx.translate(0, canvas.height); ctx.scale( 1, -1); }
   ctx.drawImage(img, 0, 0);
   ctx.restore();
-  const newDataURL = canvas.toDataURL('image/jpeg', 0.92);
   const blob = await new Promise(res => canvas.toBlob(res, 'image/jpeg', 0.92));
   const newFile = new File([blob], cell.name, { type: 'image/jpeg' });
-  grid[r][c] = { ...cell, dataURL: newDataURL, file: newFile };
+  const thumbURL = await makeThumbnail(newFile);
+  grid[r][c] = { ...cell, dataURL: thumbURL, file: newFile };
   render();
 }
 
 async function makeCells(files) {
   const imgs = [...files].filter(f => f.type.startsWith('image/'));
   return Promise.all(imgs.map(async f => ({
-    id: uid(), name: f.name, file: f, dataURL: await readDataURL(f),
+    id: uid(), name: f.name, file: f, dataURL: await makeThumbnail(f),
   })));
 }
 
@@ -1154,7 +1237,7 @@ function buildCell(cell, r, c) {
     if (e.dataTransfer.files.length) return;
     if (!dragSrc) return;
     const { r: sr, c: sc } = dragSrc;
-    if (sr !== r || sc !== c) { swapCells(sr, sc, r, c); render(); }
+    if (sr !== r || sc !== c) { moveCellToZone(sr, sc, r, c, zoneAt(e.clientX, e.clientY, el)); render(); }
   });
 
   return el;
@@ -1177,14 +1260,13 @@ function buildEmptyCell(r, c) {
 
 function zoneAt(clientX, clientY, el) {
   const rect = el.getBoundingClientRect();
-  const x = (clientX - rect.left) / rect.width;
-  const y = (clientY - rect.top)  / rect.height;
-  const E = 0.28;
-  if (x < E)     return 'left';
-  if (x > 1 - E) return 'right';
-  if (y < E)     return 'top';
-  if (y > 1 - E) return 'bottom';
-  return 'center';
+  const nx = (clientX - (rect.left + rect.right)  / 2) / (rect.width  / 2);
+  const ny = (clientY - (rect.top  + rect.bottom) / 2) / (rect.height / 2);
+  // Small central region snaps to center (replace), everywhere else snaps to nearest side
+  if (Math.abs(nx) < 0.33 && Math.abs(ny) < 0.33) return 'center';
+  return Math.abs(nx) >= Math.abs(ny)
+    ? (nx > 0 ? 'right' : 'left')
+    : (ny > 0 ? 'bottom' : 'top');
 }
 
 function activateZone(overlay, zone) {
@@ -1249,7 +1331,15 @@ document.addEventListener('dragleave', e => {
 document.addEventListener('dragover', e => {
   if (!isFileDrag(e)) return;
   e.preventDefault();
-  updateDropHighlight(e.clientX, e.clientY);
+  _lastDragX = e.clientX;
+  _lastDragY = e.clientY;
+  if (!_rafPending) {
+    _rafPending = true;
+    requestAnimationFrame(() => {
+      updateDropHighlight(_lastDragX, _lastDragY);
+      _rafPending = false;
+    });
+  }
 });
 document.addEventListener('drop', e => {
   if (!e.dataTransfer.files.length) return;
@@ -1281,8 +1371,10 @@ fileInput.addEventListener('change', e => {
   fileInput.value = '';
 });
 
-addColBtn.addEventListener('click', () => { if (hasImages()) { insertCol(nCols() - 1); render(); } });
-addRowBtn.addEventListener('click', () => { if (hasImages()) { insertRow(nRows() - 1); render(); } });
+addLeftBtn.addEventListener('click', () => { if (hasImages()) { insertCol(-1); render(); } });
+addRightBtn.addEventListener('click', () => { if (hasImages()) { insertCol(nCols() - 1); render(); } });
+addTopBtn.addEventListener('click', () => { if (hasImages()) { insertRow(-1); render(); } });
+addBottomBtn.addEventListener('click', () => { if (hasImages()) { insertRow(nRows() - 1); render(); } });
 
 function _buildFormData() {
   const formData = new FormData();
@@ -1317,10 +1409,14 @@ stitchBtn.addEventListener('click', async () => {
     const blob = await res.blob();
     if (_previewObjectURL) URL.revokeObjectURL(_previewObjectURL);
     _previewObjectURL = URL.createObjectURL(blob);
+    previewImg.onload = () => {
+      const landscape = previewImg.naturalWidth >= previewImg.naturalHeight;
+      appBody.classList.toggle('layout-side', !landscape);
+      appBody.classList.toggle('layout-stack', landscape);
+      appBody.classList.add('has-preview');
+    };
     previewImg.src = _previewObjectURL;
     downloadBtn.href = _previewObjectURL;
-    previewArea.style.display = 'block';
-    previewArea.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     const kb = Math.round(blob.size / 1024);
     statusEl.textContent = `Stitched · ${kb} KB`;
   } catch (err) {
@@ -1377,6 +1473,33 @@ def _stitch_grid(layout, paths, td, fit=False):
     if first_path is None:
         return None
 
+    if fit:
+        if num_rows == 1:
+            # Single-row horizontal: scale each image to the tallest row height
+            target_h = row_heights[0]
+            for c, img in enumerate(grid[0]):
+                if img is not None and img.height != target_h:
+                    new_w = round(img.width * target_h / img.height)
+                    grid[0][c] = img.resize((new_w, target_h), Image.LANCZOS)
+            col_widths = [
+                grid[0][c].width if grid[0][c] is not None else 0
+                for c in range(num_cols)
+            ]
+        else:
+            # Vertical single-column or multi-row grid: scale each image to its column width
+            for r, row in enumerate(grid):
+                for c, img in enumerate(row):
+                    if img is not None:
+                        target_w = col_widths[c]
+                        if img.width != target_w:
+                            new_h = round(img.height * target_w / img.width)
+                            grid[r][c] = img.resize((target_w, new_h), Image.LANCZOS)
+            row_heights = [0] * num_rows
+            for r, row in enumerate(grid):
+                for c, img in enumerate(row):
+                    if img is not None:
+                        row_heights[r] = max(row_heights[r], img.height)
+
     total_w = sum(col_widths)
     total_h = sum(row_heights)
     if total_w == 0 or total_h == 0:
@@ -1392,12 +1515,6 @@ def _stitch_grid(layout, paths, td, fit=False):
         x_off = 0
         for c, img in enumerate(row):
             if img is not None:
-                if fit:
-                    cell_w, cell_h = col_widths[c], row_heights[r]
-                    scale = min(cell_w / img.width, cell_h / img.height)
-                    new_w, new_h = round(img.width * scale), round(img.height * scale)
-                    if (new_w, new_h) != (img.width, img.height):
-                        img = img.resize((new_w, new_h), Image.LANCZOS)
                 canvas.paste(img, (x_off, y_off))
             x_off += col_widths[c]
         y_off += row_heights[r]
