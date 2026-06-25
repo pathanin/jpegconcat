@@ -120,7 +120,7 @@ class Jpegconcat < Formula
 
     (bin/"jpegconcat").write <<~EOS
       #!/bin/bash
-      exec "#{libexec}/bin/python" -B "#{libexec}/concat_jpeg.py" "$@"
+      exec "#{libexec}/bin/python" "#{libexec}/concat_jpeg.py" "$@"
     EOS
     (bin/"jpegconcat").chmod 0755
   end
