@@ -65,9 +65,55 @@ _MCU_DIMS = {0: (8, 8), 1: (16, 8), 2: (16, 16)}
 
 # ── JPEG parameter detection ──────────────────────────────────────────────────
 
+def _parse_sof_subsampling(data):
+    """Extract chroma subsampling from raw JPEG bytes (SOF marker scan).
+
+    Returns 0/1/2 for 4:4:4 / 4:2:2 / 4:2:0, or 2 (default) on failure.
+    """
+    try:
+        if data[0:2] != b'\xff\xd8':
+            return 2
+        pos = 2
+        while pos < len(data) - 1:
+            if data[pos] != 0xFF:
+                return 2
+            marker = data[pos + 1]
+            if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
+                pos += 2
+                continue
+            if marker == 0xDA:
+                break
+            if pos + 3 >= len(data):
+                break
+            seg_len = (data[pos + 2] << 8) | data[pos + 3]
+            if seg_len < 2:
+                break
+            seg_start = pos + 4
+            seg_end = min(pos + 2 + seg_len, len(data))
+            if marker in (0xC0, 0xC1, 0xC2):
+                seg = data[seg_start:seg_end]
+                if len(seg) >= 15 and seg[5] >= 3:
+                    y_h,  y_v  = seg[7] >> 4, seg[7] & 0xF
+                    cb_h, cb_v = seg[10] >> 4, seg[10] & 0xF
+                    if y_h == cb_h and y_v == cb_v:
+                        return 0
+                    elif y_v == cb_v:
+                        return 1
+                    else:
+                        return 2
+                break
+            pos += 2 + seg_len
+    except Exception:
+        pass
+    return 2
+
+
 def _jpeg_params(path):
     """
     Return (qtables, quality, subsampling, is_grayscale) for a JPEG file.
+
+    Reads the file exactly once — binary data is parsed for subsampling,
+    Pillow's header-only open extracts quantization tables.
 
     qtables — Pillow's img.quantization dict (exact tables from libjpeg, suitable
               for canvas.save(qtables=...)), or None if unavailable.
@@ -80,8 +126,11 @@ def _jpeg_params(path):
     subsampling = 2
     is_grayscale = False
 
-    # Quality + tables: use Pillow's libjpeg-parsed quantization dict (header-only open)
     try:
+        with open(path, "rb") as f:
+            raw = f.read()
+
+        subsampling = _parse_sof_subsampling(raw)
         _img = Image.open(path)
         is_grayscale = (_img.mode == "L")
         if _img.quantization:
@@ -94,46 +143,34 @@ def _jpeg_params(path):
     except Exception:
         pass
 
-    # Subsampling: stream the SOF marker (no clean public Pillow API for this)
-    try:
-        with open(path, "rb") as f:
-            if f.read(2) == b'\xff\xd8':
-                while True:
-                    b = f.read(2)
-                    if len(b) < 2 or b[0] != 0xFF:
-                        break
-                    marker = b[1]
-                    if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
-                        continue
-                    if marker == 0xDA:
-                        break
-                    lb = f.read(2)
-                    if len(lb) < 2:
-                        break
-                    seg_len = struct.unpack(">H", lb)[0]
-                    if seg_len < 2:
-                        break
-                    seg = f.read(seg_len - 2)
-                    if marker in (0xC0, 0xC1, 0xC2):
-                        if len(seg) >= 15 and seg[5] >= 3:
-                            y_h,  y_v  = seg[7] >> 4, seg[7] & 0xF
-                            cb_h, cb_v = seg[10] >> 4, seg[10] & 0xF
-                            if y_h == cb_h and y_v == cb_v:
-                                subsampling = 0
-                            elif y_v == cb_v:
-                                subsampling = 1
-                            else:
-                                subsampling = 2
-                        break
-    except Exception:
-        pass
+    return qtables, quality, subsampling, is_grayscale
+
+
+def _jpeg_params_from_image(img):
+    """Extract JPEG params from an already-opened PIL Image (avoids re-reading disk).
+
+    For JPEG images, still does a binary read for SOF subsampling since Pillow
+    doesn't expose it cleanly. For non-JPEG, returns defaults.
+    """
+    qtables = None
+    quality = 85
+    subsampling = 2
+    is_grayscale = (img.mode == "L")
+
+    if img.format == "JPEG" and img.quantization:
+        qtables = img.quantization
+        tbl = qtables.get(0, [])
+        if len(tbl) == 64:
+            s = sum(tbl[k] * 100 / _STD_LUMA[k] for k in range(64)) / 64
+            q = (200 - s) / 2 if s <= 100 else 5000 / s
+            quality = max(1, min(95, round(q)))
 
     return qtables, quality, subsampling, is_grayscale
 
 
 # ── jpegtran lossless fast-path ───────────────────────────────────────────────
 
-def _try_lossless(image_paths, images, input_formats, output_path, direction, qtables, subsampling):
+def _try_lossless(image_paths, images, input_formats, output_path, direction, qtables, subsampling, all_subsampling=None):
     """
     Attempt lossless DCT-level concatenation via jpegtran -drop.
 
@@ -158,16 +195,18 @@ def _try_lossless(image_paths, images, input_formats, output_path, direction, qt
     if not all(fmt == "JPEG" for fmt in input_formats):
         return False
 
-    # All inputs must share the same subsampling as the first image
-    for path in image_paths[1:]:
-        _, _, s, _ = _jpeg_params(path)
-        if s != subsampling:
+    if all_subsampling is not None:
+        if any(s != subsampling for s in all_subsampling):
             return False
+    else:
+        for path in image_paths[1:]:
+            _, _, s, _ = _jpeg_params(path)
+            if s != subsampling:
+                return False
 
     mcu_w, mcu_h = _MCU_DIMS.get(subsampling, (8, 8))
 
     if direction == "horizontal":
-        # Every image's height and every cumulative x-offset must be MCU-aligned
         if not all(img.height % mcu_h == 0 for img in images):
             return False
         x = 0
@@ -175,7 +214,7 @@ def _try_lossless(image_paths, images, input_formats, output_path, direction, qt
             x += img.width
             if x % mcu_w != 0:
                 return False
-    else:  # vertical
+    else:
         if not all(img.width % mcu_w == 0 for img in images):
             return False
         y = 0
@@ -381,17 +420,29 @@ def concat_images(image_paths, output_path=None, direction="auto", order="auto")
 
     output_path may be None — the path is auto-generated next to the first input.
     """
-    opened = [Image.open(p) for p in image_paths]
-    input_formats = [img.format for img in opened]
-    _first_exif = opened[0].info.get('exif') if input_formats[0] == "JPEG" else None
+    _first = Image.open(image_paths[0])
+    _first_format = _first.format
+    _first_exif = _first.info.get('exif') if _first_format == "JPEG" else None
 
     if output_path is None:
-        output_path = _make_output_path(image_paths, opened)
+        fmt = _first.format or "JPEG"
+        out_dir = os.path.dirname(os.path.abspath(image_paths[0]))
+        ext = _FORMAT_TO_EXT.get(fmt, ".jpg")
+        stem = "concat"
+        candidate = os.path.join(out_dir, f"{stem}{ext}")
+        n = 2
+        while os.path.exists(candidate):
+            candidate = os.path.join(out_dir, f"{stem}_{n}{ext}")
+            n += 1
+        output_path = candidate
+    _first.close()
 
-    images = [img.convert("RGB") for img in opened]
-    for _o in opened:
-        _o.close()
-    del opened
+    images = []
+    input_formats = []
+    for p in image_paths:
+        with Image.open(p) as img:
+            input_formats.append(img.format)
+            images.append(img.convert("RGB"))
 
     preserve_order  = (order != "auto")
     fix_direction = None if direction == "auto" else direction
@@ -439,8 +490,17 @@ def concat_images(image_paths, output_path=None, direction="auto", order="auto")
     else:
         qtables, quality, subsampling = None, 85, 2
 
-    # ── Lossless fast-path: jpegtran -drop (DCT-level, no pixel decode/encode) ─
-    lossless = _try_lossless(image_paths, images, input_formats, output_path, direction, qtables, subsampling)
+    all_subsampling = None
+    if _HAS_NUMPY and len(image_paths) > 1 and input_formats[0] == "JPEG":
+        all_subsampling = [subsampling]
+        for i in range(1, len(image_paths)):
+            if input_formats[i] == "JPEG":
+                _, _, s, _ = _jpeg_params(image_paths[i])
+                all_subsampling.append(s)
+            else:
+                all_subsampling.append(2)
+
+    lossless = _try_lossless(image_paths, images, input_formats, output_path, direction, qtables, subsampling, all_subsampling=all_subsampling)
 
     # ── Pillow re-encode fallback ─────────────────────────────────────────────
     if not lossless:
@@ -1240,14 +1300,20 @@ def _stitch_grid(layout, paths, td):
 
     col_widths  = [0] * num_cols
     row_heights = [0] * num_rows
+    grid = []
     for r, row in enumerate(layout):
+        grid_row = []
         for c, fid in enumerate(row):
             if fid and fid in paths:
-                with Image.open(paths[fid]) as _img:
-                    if first_path is None:
-                        first_path = paths[fid]
-                    col_widths[c]  = max(col_widths[c],  _img.width)
-                    row_heights[r] = max(row_heights[r], _img.height)
+                img = Image.open(paths[fid]).convert("RGB")
+                if first_path is None:
+                    first_path = paths[fid]
+                col_widths[c]  = max(col_widths[c],  img.width)
+                row_heights[r] = max(row_heights[r], img.height)
+                grid_row.append(img)
+            else:
+                grid_row.append(None)
+        grid.append(grid_row)
 
     if first_path is None:
         return None
@@ -1263,12 +1329,11 @@ def _stitch_grid(layout, paths, td):
 
     canvas = Image.new("RGB", (total_w, total_h), (0, 0, 0))
     y_off = 0
-    for r, row in enumerate(layout):
+    for r, row in enumerate(grid):
         x_off = 0
-        for c, fid in enumerate(row):
-            if fid and fid in paths:
-                with Image.open(paths[fid]) as _img:
-                    canvas.paste(_img.convert("RGB"), (x_off, y_off))
+        for c, img in enumerate(row):
+            if img is not None:
+                canvas.paste(img, (x_off, y_off))
             x_off += col_widths[c]
         y_off += row_heights[r]
 
@@ -1299,7 +1364,7 @@ def _run_web_server(port=5001):
         )
         sys.exit(1)
 
-    import io, json as _json, threading, webbrowser
+    import json as _json, threading, webbrowser
     from flask import Flask, abort, request, send_file
 
     app = Flask(__name__)
@@ -1353,12 +1418,8 @@ def _run_web_server(port=5001):
             if output is None:
                 abort(500, "Nothing to stitch")
 
-            buf = io.BytesIO()
-            with open(output, "rb") as fh:
-                buf.write(fh.read())
-            buf.seek(0)
             return send_file(
-                buf, mimetype="image/jpeg",
+                output, mimetype="image/jpeg",
                 as_attachment=True, download_name="stitched.jpg",
             )
 

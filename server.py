@@ -10,7 +10,6 @@ is not used). Encoding params (quantization tables + subsampling) are read from
 the first image in the grid, matching the CLI's Pillow fallback behavior.
 """
 
-import io
 import json
 import os
 import sys
@@ -76,11 +75,7 @@ def stitch():
         if output is None:
             abort(500, 'Nothing to stitch')
 
-        buf = io.BytesIO()
-        with open(output, 'rb') as fh:
-            buf.write(fh.read())
-        buf.seek(0)
-        return send_file(buf, mimetype='image/jpeg',
+        return send_file(output, mimetype='image/jpeg',
                          as_attachment=True,
                          download_name='stitched.jpg')
 
