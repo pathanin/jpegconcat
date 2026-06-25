@@ -23,4 +23,4 @@ if command -v open    &>/dev/null; then open    "$URL"
 elif command -v xdg-open &>/dev/null; then xdg-open "$URL" &
 fi
 
-exec python3 server.py
+exec python3 concat_jpeg.py --web
