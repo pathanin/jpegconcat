@@ -13,9 +13,9 @@ Auto-detection (both on by default):
   direction: for 2 images, determined by edge-color seam matching; otherwise
              portrait → horizontal, landscape → vertical
 
-Note: The lossless jpegtran fast-path uses -copy none and strips all metadata
-(EXIF, ICC profiles, XMP). The Pillow fallback preserves EXIF from the first
-source image.
+Note: The lossless jpegtran fast-path uses -copy all to preserve metadata from
+the first source image (EXIF, ICC profiles, XMP). The Pillow fallback also
+preserves EXIF from the first source image.
 """
 
 import argparse
@@ -28,7 +28,7 @@ import sys
 import tempfile
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageOps
 except ImportError:
     print("Pillow not installed. Run: pip install Pillow --break-system-packages")
     sys.exit(1)
@@ -176,11 +176,10 @@ def _try_lossless(image_paths, images, input_formats, output_path, direction, qt
 
     Returns True on success, False if any precondition is unmet.
 
-    NOTE: jpegtran is called with -copy none, so all metadata (EXIF, ICC
-    profiles, XMP) is stripped from the output. This is unavoidable with
-    the DCT-level compositing approach — there is no source image whose
-    metadata accurately describes the composite. Use the Pillow fallback
-    path if metadata preservation is required.
+    NOTE: jpegtran is called with -copy all, so metadata (EXIF, ICC
+    profiles, XMP) from the first source image is preserved in the output.
+    Metadata from subsequent source images is discarded, which is expected
+    for a composite.
 
     Preconditions:
       - jpegtran (libjpeg-turbo >= 1.4) is in PATH
@@ -238,13 +237,13 @@ def _try_lossless(image_paths, images, input_formats, output_path, direction, qt
             blank.save(canvas_path, "JPEG", quality=85, subsampling=subsampling)
 
         # Drop each source image into the canvas at its offset (DCT-level, no re-encode)
-        # -copy none: no metadata propagates (see docstring above)
+        # -copy all: metadata from the first source image is preserved
         current = canvas_path
         x = y = 0
         for idx, (path, img) in enumerate(zip(image_paths, images)):
             out_path = os.path.join(td, f"step_{idx}.jpg")
             result = subprocess.run(
-                [jpegtran, "-copy", "none", "-drop", f"+{x}+{y}", path, current],
+                [jpegtran, "-copy", "all", "-drop", f"+{x}+{y}", path, current],
                 capture_output=True,
             )
             if result.returncode != 0 or not result.stdout:
@@ -415,7 +414,7 @@ def _make_output_path(image_paths, opened_images):
 
 # ── Main concat logic ─────────────────────────────────────────────────────────
 
-def concat_images(image_paths, output_path=None, direction="auto", order="auto"):
+def concat_images(image_paths, output_path=None, direction="auto", order="auto", fit=False):
     """Concatenate images preserving source encoding parameters.
 
     output_path may be None — the path is auto-generated next to the first input.
@@ -442,7 +441,7 @@ def concat_images(image_paths, output_path=None, direction="auto", order="auto")
     for p in image_paths:
         with Image.open(p) as img:
             input_formats.append(img.format)
-            images.append(img.convert("RGB"))
+            images.append(ImageOps.exif_transpose(img).convert("RGB"))
 
     preserve_order  = (order != "auto")
     fix_direction = None if direction == "auto" else direction
@@ -480,6 +479,23 @@ def concat_images(image_paths, output_path=None, direction="auto", order="auto")
             print("(install numpy for edge-color seam matching)")
 
     print(f"\nLayout: {direction}")
+
+    if fit:
+        if direction == "horizontal":
+            target_h = max(img.height for img in images)
+            images = [
+                img.resize((round(img.width * target_h / img.height), target_h), Image.LANCZOS)
+                if img.height != target_h else img
+                for img in images
+            ]
+        else:
+            target_w = max(img.width for img in images)
+            images = [
+                img.resize((target_w, round(img.height * target_w / img.width)), Image.LANCZOS)
+                if img.width != target_w else img
+                for img in images
+            ]
+        print(f"Fit: resized images to share {'height' if direction == 'horizontal' else 'width'}")
 
     # Detect encoding params from the first input image
     first = image_paths[0]
@@ -615,6 +631,34 @@ h1 { font-size: 1rem; font-weight: 600; letter-spacing: -0.01em; }
 }
 #stitch-btn:hover:not(:disabled) { background: #1d4ed8; }
 #stitch-btn:disabled { background: #2a2a2a; color: #555; cursor: default; }
+
+#preview-area {
+  display: none;
+  margin: 16px 32px 24px;
+  text-align: center;
+}
+#preview-img {
+  max-width: 100%;
+  max-height: 60vh;
+  border: 1px solid #333;
+  border-radius: 6px;
+  background: #111;
+}
+#download-btn {
+  display: inline-block;
+  margin-top: 10px;
+  padding: 7px 18px;
+  background: #16a34a;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  font-size: 0.85rem;
+  font-weight: 500;
+  cursor: pointer;
+  text-decoration: none;
+  transition: background 0.12s;
+}
+#download-btn:hover { background: #15803d; }
 
 main {
   flex: 1;
@@ -851,7 +895,10 @@ main {
   <h1>Image Stitcher</h1>
   <div class="header-right">
     <span id="status">Drop images to start</span>
-    <button id="stitch-btn" disabled>Stitch &amp; Download</button>
+    <label style="display:flex;align-items:center;gap:6px;font-size:0.875rem;color:#ccc;cursor:pointer">
+      <input type="checkbox" id="fit-toggle"> Fit images to layout
+    </label>
+    <button id="stitch-btn" disabled>Stitch &amp; Preview</button>
   </div>
 </header>
 
@@ -875,6 +922,12 @@ main {
   </div>
 </main>
 
+<div id="preview-area">
+  <img id="preview-img" alt="Stitched preview">
+  <br>
+  <a id="download-btn" download="stitched.jpg">Download</a>
+</div>
+
 <div id="processing">
   <div class="spinner"></div>
   <span>Stitching&hellip;</span>
@@ -896,6 +949,9 @@ const addRowBtn    = document.getElementById('add-row-btn');
 const stitchBtn    = document.getElementById('stitch-btn');
 const statusEl     = document.getElementById('status');
 const processingEl = document.getElementById('processing');
+const previewArea  = document.getElementById('preview-area');
+const previewImg   = document.getElementById('preview-img');
+const downloadBtn  = document.getElementById('download-btn');
 
 const uid = () => Math.random().toString(36).slice(2, 9);
 
@@ -1228,48 +1284,51 @@ fileInput.addEventListener('change', e => {
 addColBtn.addEventListener('click', () => { if (hasImages()) { insertCol(nCols() - 1); render(); } });
 addRowBtn.addEventListener('click', () => { if (hasImages()) { insertRow(nRows() - 1); render(); } });
 
+function _buildFormData() {
+  const formData = new FormData();
+  const layoutIds = grid.map(row => row.map(cell => cell ? cell.id : null));
+  formData.append('layout', JSON.stringify(layoutIds));
+  formData.append('fit', document.getElementById('fit-toggle').checked);
+  const seen = new Set();
+  for (const row of grid) {
+    for (const cell of row) {
+      if (cell && !seen.has(cell.id)) {
+        formData.append(cell.id, cell.file, cell.name);
+        seen.add(cell.id);
+      }
+    }
+  }
+  return formData;
+}
+
+let _previewObjectURL = null;
+
 stitchBtn.addEventListener('click', async () => {
   if (!hasImages()) return;
   processingEl.classList.add('visible');
+  stitchBtn.textContent = 'Stitching…';
   stitchBtn.disabled = true;
   try {
-    const formData = new FormData();
-    const layoutIds = grid.map(row => row.map(cell => cell ? cell.id : null));
-    formData.append('layout', JSON.stringify(layoutIds));
-    const seen = new Set();
-    for (const row of grid) {
-      for (const cell of row) {
-        if (cell && !seen.has(cell.id)) {
-          formData.append(cell.id, cell.file, cell.name);
-          seen.add(cell.id);
-        }
-      }
-    }
-    const res = await fetch('/stitch', { method: 'POST', body: formData });
+    const res = await fetch('/preview', { method: 'POST', body: _buildFormData() });
     if (!res.ok) {
       const msg = await res.text().catch(() => res.statusText);
       throw new Error(`Server error ${res.status}: ${msg}`);
     }
     const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'stitched.jpg';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    if (_previewObjectURL) URL.revokeObjectURL(_previewObjectURL);
+    _previewObjectURL = URL.createObjectURL(blob);
+    previewImg.src = _previewObjectURL;
+    downloadBtn.href = _previewObjectURL;
+    previewArea.style.display = 'block';
+    previewArea.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     const kb = Math.round(blob.size / 1024);
-    statusEl.textContent = `Downloaded · ${kb} KB`;
-    setTimeout(() => {
-      const n = imgCount();
-      statusEl.textContent = `${n} image${n !== 1 ? 's' : ''} · ${nRows()}×${nCols()} grid`;
-    }, 2500);
+    statusEl.textContent = `Stitched · ${kb} KB`;
   } catch (err) {
     console.error(err);
     statusEl.textContent = 'Error: ' + err.message;
   } finally {
     processingEl.classList.remove('visible');
+    stitchBtn.textContent = 'Stitch & Preview';
     stitchBtn.disabled = imgCount() < 2;
   }
 });
@@ -1278,7 +1337,7 @@ stitchBtn.addEventListener('click', async () => {
 </html>"""
 
 
-def _stitch_grid(layout, paths, td):
+def _stitch_grid(layout, paths, td, fit=False):
     """
     Composite a 2D grid of images into a single JPEG.
 
@@ -1305,7 +1364,7 @@ def _stitch_grid(layout, paths, td):
         grid_row = []
         for c, fid in enumerate(row):
             if fid and fid in paths:
-                img = Image.open(paths[fid]).convert("RGB")
+                img = ImageOps.exif_transpose(Image.open(paths[fid])).convert("RGB")
                 if first_path is None:
                     first_path = paths[fid]
                 col_widths[c]  = max(col_widths[c],  img.width)
@@ -1333,6 +1392,12 @@ def _stitch_grid(layout, paths, td):
         x_off = 0
         for c, img in enumerate(row):
             if img is not None:
+                if fit:
+                    cell_w, cell_h = col_widths[c], row_heights[r]
+                    scale = min(cell_w / img.width, cell_h / img.height)
+                    new_w, new_h = round(img.width * scale), round(img.height * scale)
+                    if (new_w, new_h) != (img.width, img.height):
+                        img = img.resize((new_w, new_h), Image.LANCZOS)
                 canvas.paste(img, (x_off, y_off))
             x_off += col_widths[c]
         y_off += row_heights[r]
@@ -1364,7 +1429,7 @@ def _run_web_server(port=5001):
         )
         sys.exit(1)
 
-    import json as _json, threading, webbrowser
+    import io, json as _json, threading, webbrowser
     from flask import Flask, abort, request, send_file
 
     app = Flask(__name__)
@@ -1378,12 +1443,10 @@ def _run_web_server(port=5001):
     def index():
         return _WEB_UI_HTML, 200, {"Content-Type": "text/html; charset=utf-8"}
 
-    @app.route("/stitch", methods=["POST"])
-    def stitch():
+    def _validate_layout():
         layout_raw = request.form.get("layout")
         if not layout_raw:
             abort(400, "Missing layout")
-
         try:
             layout = _json.loads(layout_raw)
             if not isinstance(layout, list):
@@ -1393,17 +1456,18 @@ def _run_web_server(port=5001):
             abort(400, "Invalid layout")
         if not layout:
             abort(400, "Empty layout")
-
         num_cols = max(len(r) for r in layout)
         for row in layout:
             while len(row) < num_cols:
                 row.append(None)
-
         non_empty = [c for c in range(num_cols) if any(r[c] is not None for r in layout)]
         if not non_empty:
             abort(400, "No images in layout")
-        layout = [[row[c] for c in non_empty] for row in layout]
+        return [[row[c] for c in non_empty] for row in layout]
 
+    def _stitch_to_buf():
+        layout = _validate_layout()
+        fit = request.form.get("fit", "false").lower() == "true"
         with tempfile.TemporaryDirectory() as td:
             paths = {}
             for key, f in request.files.items():
@@ -1413,15 +1477,22 @@ def _run_web_server(port=5001):
                 dest = os.path.join(td, safe_key + ext)
                 f.save(dest)
                 paths[key] = dest
-
-            output = _stitch_grid(layout, paths, td)
+            output = _stitch_grid(layout, paths, td, fit=fit)
             if output is None:
                 abort(500, "Nothing to stitch")
+            buf = io.BytesIO(open(output, "rb").read())
+        buf.seek(0)
+        return buf
 
-            return send_file(
-                output, mimetype="image/jpeg",
-                as_attachment=True, download_name="stitched.jpg",
-            )
+    @app.route("/stitch", methods=["POST"])
+    def stitch():
+        buf = _stitch_to_buf()
+        return send_file(buf, mimetype="image/jpeg", as_attachment=True, download_name="stitched.jpg")
+
+    @app.route("/preview", methods=["POST"])
+    def preview():
+        buf = _stitch_to_buf()
+        return send_file(buf, mimetype="image/jpeg", as_attachment=False)
 
     url = f"http://localhost:{port}"
     print(f"Image Stitcher → {url}  (Ctrl-C to quit)")
@@ -1459,6 +1530,9 @@ def main():
                         metavar="{horizontal|h, vertical|v, auto|a}",
                         help="Layout direction (default: auto)")
     parser.add_argument("--order",      choices=["auto", "as-given"],  default="auto")
+    parser.add_argument("--fit", action="store_true",
+                        help="Resize images to share the layout dimension before stitching "
+                             "(height for horizontal, width for vertical)")
     parser.add_argument("--web",  "-w", action="store_true",
                         help="Launch the drag-and-drop web UI in your browser")
     parser.add_argument("--port",       type=int, default=5001,
@@ -1481,7 +1555,7 @@ def main():
 
     # Defer output-path computation to concat_images to avoid opening
     # input files twice (once here for format detection, once for processing).
-    concat_images(args.images, args.output, direction, args.order)
+    concat_images(args.images, args.output, direction, args.order, fit=args.fit)
 
 
 if __name__ == "__main__":
