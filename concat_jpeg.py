@@ -309,6 +309,92 @@ def _seam_mad(img_a, side_a, img_b, side_b):
     return float(np.mean(np.abs(_edge_strip(img_a, side_a) - _edge_strip(img_b, side_b))))
 
 
+def _make_blend_mask(w, h, direction):
+    """Linear gradient mask for cross-fade blending in the overlap zone.
+
+    direction='horizontal': 0 (shows prev) on left  → 255 (shows next) on right
+    direction='vertical':   0 (shows prev) on top   → 255 (shows next) on bottom
+    PIL composite: mask=0 → image2 (prev), mask=255 → image1 (next)
+    """
+    if direction == "horizontal":
+        row = Image.new("L", (w, 1))
+        pix = row.load()
+        denom = max(w - 1, 1)
+        for x in range(w):
+            pix[x, 0] = round(255 * x / denom)
+        return row.resize((w, h), Image.NEAREST)
+    else:
+        col = Image.new("L", (1, h))
+        pix = col.load()
+        denom = max(h - 1, 1)
+        for y in range(h):
+            pix[0, y] = round(255 * y / denom)
+        return col.resize((w, h), Image.NEAREST)
+
+
+def _suggest_overlap(imgs, direction):
+    """
+    Suggest an overlap in pixels by finding where the blend zone has the
+    flattest (most background-like) content in both images.
+
+    Scans up to 30% of the join dimension in ~60 steps and picks the overlap
+    where combined edge variance is lowest — that zone falls on neutral
+    backgrounds rather than on subjects or text.
+
+    Falls back to 10% of join dimension when numpy is unavailable.
+    """
+    if direction == "horizontal":
+        dim = min(img.width for img in imgs)
+    else:
+        dim = min(img.height for img in imgs)
+
+    fallback = max(30, round(dim * 0.10))
+    if not _HAS_NUMPY or len(imgs) < 2:
+        return fallback
+
+    img_a, img_b = imgs[0], imgs[1]
+    max_ov = round(dim * 0.30)
+    if max_ov < 10:
+        return fallback
+
+    PERP = 64           # thumbnail size in the non-join dimension
+    N    = 60           # number of candidate steps
+    step = max(1, max_ov // N)
+
+    try:
+        if direction == "horizontal":
+            a = np.asarray(
+                img_a.crop((img_a.width - max_ov, 0, img_a.width, img_a.height))
+                     .resize((max_ov, PERP), Image.LANCZOS), dtype=np.float32)
+            b = np.asarray(
+                img_b.crop((0, 0, max_ov, img_b.height))
+                     .resize((max_ov, PERP), Image.LANCZOS), dtype=np.float32)
+            def _zone_score(ov):
+                return float(np.std(a[:, max_ov - ov:]) + np.std(b[:, :ov]))
+        else:
+            a = np.asarray(
+                img_a.crop((0, img_a.height - max_ov, img_a.width, img_a.height))
+                     .resize((PERP, max_ov), Image.LANCZOS), dtype=np.float32)
+            b = np.asarray(
+                img_b.crop((0, 0, img_b.width, max_ov))
+                     .resize((PERP, max_ov), Image.LANCZOS), dtype=np.float32)
+            def _zone_score(ov):
+                return float(np.std(a[max_ov - ov:]) + np.std(b[:ov]))
+
+        scores = [(ov, _zone_score(ov)) for ov in range(step, max_ov + 1, step)]
+        if not scores:
+            return fallback
+        min_score = min(s for _, s in scores)
+        # Among candidates within 5% of the minimum, prefer the smallest overlap.
+        # This avoids greedily choosing large overlaps when the variance curve is flat.
+        # Floor at fallback (10%) so dissimilar images still get a tasteful default.
+        threshold = min_score * 1.05
+        best_ov = min(ov for ov, s in scores if s <= threshold)
+        return max(fallback, best_ov)
+    except Exception:
+        return fallback
+
+
 def _visual_balance(img, direction):
     """
     Grayscale brightness asymmetry across the image midpoint.
@@ -414,7 +500,7 @@ def _make_output_path(image_paths, opened_images):
 
 # ── Main concat logic ─────────────────────────────────────────────────────────
 
-def concat_images(image_paths, output_path=None, direction="auto", order="auto", fit=False):
+def concat_images(image_paths, output_path=None, direction="auto", order="auto", fit=False, overlap=0, overlap_blend="hard"):
     """Concatenate images preserving source encoding parameters.
 
     output_path may be None — the path is auto-generated next to the first input.
@@ -516,25 +602,58 @@ def concat_images(image_paths, output_path=None, direction="auto", order="auto",
             else:
                 all_subsampling.append(2)
 
-    lossless = _try_lossless(image_paths, images, input_formats, output_path, direction, qtables, subsampling, all_subsampling=all_subsampling)
+    if overlap > 0:
+        min_join_dim = (min(img.width for img in images) if direction == "horizontal"
+                        else min(img.height for img in images))
+        if overlap >= min_join_dim:
+            overlap = max(0, min_join_dim - 1)
+            print(f"Warning: overlap clamped to {overlap}px")
+
+    lossless = overlap == 0 and _try_lossless(image_paths, images, input_formats, output_path, direction, qtables, subsampling, all_subsampling=all_subsampling)
 
     # ── Pillow re-encode fallback ─────────────────────────────────────────────
     if not lossless:
         if direction == "horizontal":
-            total_w = sum(img.width  for img in images)
+            total_w = sum(img.width  for img in images) - overlap * (len(images) - 1)
             total_h = max(img.height for img in images)
             canvas  = Image.new("RGB", (total_w, total_h), (0, 0, 0))
             x = 0
-            for img in images:
-                canvas.paste(img, (x, 0))
+            for i, img in enumerate(images):
+                if i > 0 and overlap > 0:
+                    x -= overlap
+                    if overlap_blend == "fade":
+                        blend_h    = min(img.height, canvas.height)
+                        left_crop  = canvas.crop((x, 0, x + overlap, blend_h))
+                        right_crop = img.crop((0, 0, overlap, blend_h))
+                        mask = _make_blend_mask(overlap, blend_h, "horizontal")
+                        canvas.paste(Image.composite(right_crop, left_crop, mask), (x, 0))
+                        if img.width > overlap:
+                            canvas.paste(img.crop((overlap, 0, img.width, img.height)), (x + overlap, 0))
+                    else:
+                        canvas.paste(img, (x, 0))
+                else:
+                    canvas.paste(img, (x, 0))
                 x += img.width
         else:
             total_w = max(img.width  for img in images)
-            total_h = sum(img.height for img in images)
+            total_h = sum(img.height for img in images) - overlap * (len(images) - 1)
             canvas  = Image.new("RGB", (total_w, total_h), (0, 0, 0))
             y = 0
-            for img in images:
-                canvas.paste(img, (0, y))
+            for i, img in enumerate(images):
+                if i > 0 and overlap > 0:
+                    y -= overlap
+                    if overlap_blend == "fade":
+                        blend_w    = min(img.width, canvas.width)
+                        top_crop   = canvas.crop((0, y, blend_w, y + overlap))
+                        bot_crop   = img.crop((0, 0, blend_w, overlap))
+                        mask = _make_blend_mask(blend_w, overlap, "vertical")
+                        canvas.paste(Image.composite(bot_crop, top_crop, mask), (0, y))
+                        if img.height > overlap:
+                            canvas.paste(img.crop((0, overlap, img.width, img.height)), (0, y + overlap))
+                    else:
+                        canvas.paste(img, (0, y))
+                else:
+                    canvas.paste(img, (0, y))
                 y += img.height
 
         out_ext = os.path.splitext(output_path)[1].lower()
@@ -1000,6 +1119,103 @@ h1 {
 }
 
 .btn-transform:hover { background: rgba(255,255,255,0.15); color: #fff; }
+
+/* Overlap control */
+#overlap-control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 400;
+  letter-spacing: -0.224px;
+  color: #1d1d1f;
+  white-space: nowrap;
+}
+
+#overlap-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 96px;
+  height: 4px;
+  border-radius: 2px;
+  background: #e0e0e0;
+  outline: none;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+#overlap-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #0066cc;
+  cursor: pointer;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+}
+#overlap-slider::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border: none;
+  border-radius: 50%;
+  background: #0066cc;
+  cursor: pointer;
+}
+
+#overlap-val {
+  min-width: 46px;
+  font-variant-numeric: tabular-nums;
+  color: #7a7a7a;
+  text-align: right;
+}
+
+.overlap-step-btn {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  font-size: 15px;
+  font-family: inherit;
+  font-weight: 400;
+  line-height: 1;
+  background: transparent;
+  border: 1px solid #c0c0c0;
+  border-radius: 4px;
+  color: #555;
+  cursor: pointer;
+  transition: border-color 0.12s, color 0.12s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.overlap-step-btn:hover { border-color: #0066cc; color: #0066cc; }
+.overlap-step-btn:active { background: rgba(0,102,204,0.08); }
+.zoom-level-btn {
+  padding: 1px 5px;
+  font-size: 11px;
+  border: 1px solid #c0c0c0;
+  border-radius: 3px;
+  background: transparent;
+  color: #666;
+  cursor: pointer;
+}
+.zoom-level-btn.active { background: #0066cc; color: #fff; border-color: #0066cc; }
+
+#overlap-auto-btn {
+  padding: 3px 8px;
+  font-size: 12px;
+  font-family: inherit;
+  font-weight: 400;
+  background: transparent;
+  border: 1px solid #c0c0c0;
+  border-radius: 4px;
+  color: #555;
+  cursor: pointer;
+  transition: border-color 0.12s, color 0.12s;
+  line-height: 1;
+}
+#overlap-auto-btn:hover { border-color: #0066cc; color: #0066cc; }
+#overlap-auto-btn.active { border-color: #0066cc; color: #0066cc; background: rgba(0,102,204,0.06); }
+
 .toolbar-sep {
   width: 1px;
   height: 14px;
@@ -1091,6 +1307,20 @@ h1 {
       <span class="fit-toggle-switch"></span>
       <span>Fit images to layout</span>
     </label>
+    <div id="overlap-control" style="display:none">
+      <span>Overlap</span>
+      <input type="range" id="overlap-slider" min="0" max="800" value="0" step="1">
+      <button id="overlap-dec-btn" class="overlap-step-btn" title="Decrease by 1px">−</button>
+      <span id="overlap-val">0 px</span>
+      <button id="overlap-inc-btn" class="overlap-step-btn" title="Increase by 1px">+</button>
+      <button id="zoom-toggle-btn" class="overlap-step-btn" title="Zoom into the seam edge" style="width:auto;padding:0 7px;font-size:12px">Zoom</button>
+      <button id="overlap-auto-btn" class="active" title="Re-detect best overlap">Auto</button>
+      <label class="fit-toggle-label" title="Cross-fade blend instead of hard paste">
+        <input type="checkbox" id="overlap-fade-toggle" class="fit-toggle-input">
+        <span class="fit-toggle-switch"></span>
+        <span>Fade</span>
+      </label>
+    </div>
     <button id="stitch-btn" disabled>Stitch &amp; Preview</button>
   </div>
 </header>
@@ -1122,6 +1352,16 @@ h1 {
     <div id="preview-img-wrap">
       <img id="preview-img" alt="Stitched preview">
     </div>
+    <div id="zoom-panel" style="display:none;margin-top:6px">
+      <canvas id="zoom-canvas" style="width:100%;display:block;image-rendering:pixelated;border-radius:5px;background:#2c2c2e;cursor:grab"></canvas>
+      <div style="display:flex;align-items:center;gap:5px;margin-top:4px;font-size:11px;color:#888">
+        <span>Zoom:</span>
+        <button class="zoom-level-btn" data-zoom="2">2×</button>
+        <button class="zoom-level-btn active" data-zoom="3">3×</button>
+        <button class="zoom-level-btn" data-zoom="4">4×</button>
+        <span style="margin-left:6px">Drag to pan · blue = overlap bounds</span>
+      </div>
+    </div>
     <a id="download-btn" download="stitched.jpg">Download</a>
   </div>
 </div>
@@ -1140,20 +1380,118 @@ let dragEnterCount = 0;
 let _rafPending = false;
 let _lastDragX = 0, _lastDragY = 0;
 
-const appBody      = document.getElementById('app-body');
-const dropZoneEl   = document.getElementById('drop-zone');
-const fileInput    = document.getElementById('file-input');
-const gridOuter    = document.getElementById('grid-outer');
-const gridEl       = document.getElementById('grid');
-const addLeftBtn   = document.getElementById('add-left-btn');
-const addRightBtn  = document.getElementById('add-right-btn');
-const addTopBtn    = document.getElementById('add-top-btn');
-const addBottomBtn = document.getElementById('add-bottom-btn');
-const stitchBtn    = document.getElementById('stitch-btn');
-const statusEl     = document.getElementById('status');
-const processingEl = document.getElementById('processing');
-const previewImg   = document.getElementById('preview-img');
-const downloadBtn  = document.getElementById('download-btn');
+const appBody       = document.getElementById('app-body');
+const dropZoneEl    = document.getElementById('drop-zone');
+const fileInput     = document.getElementById('file-input');
+const gridOuter     = document.getElementById('grid-outer');
+const gridEl        = document.getElementById('grid');
+const addLeftBtn    = document.getElementById('add-left-btn');
+const addRightBtn   = document.getElementById('add-right-btn');
+const addTopBtn     = document.getElementById('add-top-btn');
+const addBottomBtn  = document.getElementById('add-bottom-btn');
+const stitchBtn     = document.getElementById('stitch-btn');
+const statusEl      = document.getElementById('status');
+const processingEl  = document.getElementById('processing');
+const previewImg    = document.getElementById('preview-img');
+const downloadBtn   = document.getElementById('download-btn');
+const overlapCtrl   = document.getElementById('overlap-control');
+const overlapSlider = document.getElementById('overlap-slider');
+const overlapValEl  = document.getElementById('overlap-val');
+const overlapAutoBtn    = document.getElementById('overlap-auto-btn');
+const overlapDecBtn     = document.getElementById('overlap-dec-btn');
+const overlapIncBtn     = document.getElementById('overlap-inc-btn');
+const overlapFadeToggle = document.getElementById('overlap-fade-toggle');
+const zoomToggleBtn     = document.getElementById('zoom-toggle-btn');
+const zoomPanel         = document.getElementById('zoom-panel');
+const zoomCanvas        = document.getElementById('zoom-canvas');
+
+let overlapIsAuto   = true;
+let _zoomActive     = false;
+let _zoomLevel      = 3;
+let _zoomOffsetX    = null;   // null = re-center on next render
+let _zoomOffsetY    = null;
+let _lastZoomParams = null;
+
+function _setOverlapPx(px) {
+  overlapSlider.value = px;
+  overlapValEl.textContent = px + ' px';
+}
+
+overlapSlider.addEventListener('input', () => {
+  overlapIsAuto = false;
+  overlapAutoBtn.classList.remove('active');
+  overlapValEl.textContent = overlapSlider.value + ' px';
+  scheduleLivePreview();
+});
+
+overlapAutoBtn.addEventListener('click', () => {
+  overlapIsAuto = true;
+  overlapAutoBtn.classList.add('active');
+});
+
+function _stepOverlap(delta) {
+  const v = Math.min(parseInt(overlapSlider.max), Math.max(0, parseInt(overlapSlider.value) + delta));
+  overlapSlider.value = v;
+  overlapIsAuto = false;
+  overlapAutoBtn.classList.remove('active');
+  overlapValEl.textContent = v + ' px';
+  scheduleLivePreview();
+}
+overlapDecBtn.addEventListener('click', () => _stepOverlap(-1));
+overlapIncBtn.addEventListener('click', () => _stepOverlap( 1));
+
+overlapFadeToggle.addEventListener('change', () => { scheduleLivePreview(); });
+
+zoomToggleBtn.addEventListener('click', () => {
+  _zoomActive  = !_zoomActive;
+  _zoomOffsetX = null;
+  _zoomOffsetY = null;
+  zoomToggleBtn.classList.toggle('active', _zoomActive);
+  if (!_zoomActive) zoomPanel.style.display = 'none';
+  scheduleLivePreview();
+});
+
+document.querySelectorAll('.zoom-level-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const newLevel = parseInt(btn.dataset.zoom);
+    if (_zoomOffsetX !== null) {
+      // Keep the same viewport center when changing magnification
+      const zc  = zoomCanvas;
+      const cxSrc = _zoomOffsetX + Math.ceil(zc.width  / _zoomLevel) / 2;
+      const cySrc = _zoomOffsetY + Math.ceil(zc.height / _zoomLevel) / 2;
+      _zoomLevel   = newLevel;
+      _zoomOffsetX = Math.round(cxSrc - Math.ceil(zc.width  / _zoomLevel) / 2);
+      _zoomOffsetY = Math.round(cySrc - Math.ceil(zc.height / _zoomLevel) / 2);
+    } else {
+      _zoomLevel = newLevel;
+    }
+    document.querySelectorAll('.zoom-level-btn').forEach(b => b.classList.toggle('active', b === btn));
+    if (_lastZoomParams) _renderZoomStrip(_lastZoomParams);
+  });
+});
+
+let _zoomDragX = null, _zoomDragY = null;
+zoomCanvas.addEventListener('mousedown', e => {
+  _zoomDragX = e.clientX;
+  _zoomDragY = e.clientY;
+  zoomCanvas.style.cursor = 'grabbing';
+  e.preventDefault();
+});
+window.addEventListener('mousemove', e => {
+  if (_zoomDragX === null) return;
+  const dx = e.clientX - _zoomDragX;
+  const dy = e.clientY - _zoomDragY;
+  _zoomDragX = e.clientX;
+  _zoomDragY = e.clientY;
+  if (_zoomOffsetX !== null) {
+    _zoomOffsetX = Math.round(_zoomOffsetX - dx / _zoomLevel);
+    _zoomOffsetY = Math.round(_zoomOffsetY - dy / _zoomLevel);
+  }
+  if (_lastZoomParams) _renderZoomStrip(_lastZoomParams);
+});
+window.addEventListener('mouseup', () => {
+  if (_zoomDragX !== null) { _zoomDragX = null; _zoomDragY = null; zoomCanvas.style.cursor = 'grab'; }
+});
 
 const uid = () => Math.random().toString(36).slice(2, 9);
 
@@ -1191,6 +1529,8 @@ function insertRow(after) {
 }
 
 function removeCell(r, c) {
+  const cell = grid[r][c];
+  if (cell) delete _bitmapCache[cell.id];
   grid[r][c] = null;
   compact();
 }
@@ -1310,6 +1650,7 @@ function render() {
   const n = imgCount();
   statusEl.textContent = `${n} image${n !== 1 ? 's' : ''} · ${rows}×${cols} grid`;
   stitchBtn.disabled = n < 2;
+  overlapCtrl.style.display = n >= 2 ? 'flex' : 'none';
 }
 
 function buildCell(cell, r, c) {
@@ -1522,6 +1863,8 @@ function _buildFormData() {
   const layoutIds = grid.map(row => row.map(cell => cell ? cell.id : null));
   formData.append('layout', JSON.stringify(layoutIds));
   formData.append('fit', document.getElementById('fit-toggle').checked);
+  formData.append('overlap', overlapIsAuto ? 'auto' : overlapSlider.value);
+  formData.append('overlap_blend', overlapFadeToggle.checked ? 'fade' : 'hard');
   const seen = new Set();
   for (const row of grid) {
     for (const cell of row) {
@@ -1536,6 +1879,177 @@ function _buildFormData() {
 
 let _previewObjectURL = null;
 
+// ── Live client-side preview ──────────────────────────────────────────────────
+const _bitmapCache = {};  // cell.id → ImageBitmap
+
+function _renderZoomStrip({ cv, dw0, ov, cvW, cvH }) {
+  const ZOOM   = _zoomLevel;
+  const zc     = zoomCanvas;
+  const panelW = zoomPanel.offsetWidth || 600;
+  zc.width     = panelW;
+  zc.height    = 200;
+
+  // How many source pixels fit in this viewport at the chosen zoom level
+  const vpW = Math.ceil(zc.width  / ZOOM);
+  const vpH = Math.ceil(zc.height / ZOOM);
+
+  // On first render (or after toggle/reset), center the view on the seam
+  const seamL = dw0 - ov;
+  if (_zoomOffsetX === null) {
+    _zoomOffsetX = Math.round(seamL + ov / 2 - vpW / 2);
+    _zoomOffsetY = Math.round((cvH - vpH) / 2);
+  }
+
+  const srcX = Math.max(0, Math.min(cvW - vpW, _zoomOffsetX));
+  const srcY = Math.max(0, Math.min(cvH - vpH, _zoomOffsetY));
+
+  const zctx = zc.getContext('2d');
+  zctx.clearRect(0, 0, zc.width, zc.height);
+  zctx.imageSmoothingEnabled = false;
+  zctx.drawImage(cv, srcX, srcY, vpW, vpH, 0, 0, zc.width, zc.height);
+
+  // Mark overlap left/right boundaries
+  zctx.strokeStyle = 'rgba(0,180,255,0.75)';
+  zctx.lineWidth   = 2;
+  for (const natX of [seamL, dw0]) {
+    const mx = (natX - srcX) * ZOOM;
+    if (mx >= 0 && mx <= zc.width) {
+      zctx.beginPath(); zctx.moveTo(mx, 0); zctx.lineTo(mx, zc.height); zctx.stroke();
+    }
+  }
+  zoomPanel.style.display = 'block';
+}
+
+async function _getBitmap(cell) {
+  if (!_bitmapCache[cell.id]) {
+    _bitmapCache[cell.id] = await createImageBitmap(cell.file, { imageOrientation: 'from-image' });
+  }
+  return _bitmapCache[cell.id];
+}
+
+async function updateLivePreview() {
+  const rows = nRows(), cols = nCols();
+  const is1Row = rows === 1 && cols >= 2;
+  const is1Col = cols === 1 && rows >= 2;
+  if (!hasImages() || (!is1Row && !is1Col)) return;
+
+  const direction = is1Row ? 'horizontal' : 'vertical';
+  const cells = is1Row
+    ? grid[0].filter(Boolean)
+    : grid.map(r => r[0]).filter(Boolean);
+  if (cells.length < 2) return;
+
+  let bitmaps;
+  try { bitmaps = await Promise.all(cells.map(_getBitmap)); }
+  catch (_) { return; }
+
+  const overlap = Math.max(0, parseInt(overlapSlider.value) || 0);
+  const isFade  = overlapFadeToggle.checked;
+
+  // Natural canvas size
+  let natW, natH;
+  if (direction === 'horizontal') {
+    natW = bitmaps.reduce((s, b) => s + b.width,  0) - overlap * (bitmaps.length - 1);
+    natH = Math.max(...bitmaps.map(b => b.height));
+  } else {
+    natW = Math.max(...bitmaps.map(b => b.width));
+    natH = bitmaps.reduce((s, b) => s + b.height, 0) - overlap * (bitmaps.length - 1);
+  }
+  if (natW <= 0 || natH <= 0) return;
+
+  // Scale down to ≤2000px on longest side for speed
+  const scale = Math.min(1, 2000 / Math.max(natW, natH));
+  const cvW = Math.max(1, Math.round(natW * scale));
+  const cvH = Math.max(1, Math.round(natH * scale));
+  const ov  = Math.round(overlap * scale);
+
+  const cv  = document.createElement('canvas');
+  cv.width  = cvW;
+  cv.height = cvH;
+  const ctx = cv.getContext('2d');
+
+  if (direction === 'horizontal') {
+    let x = 0;
+    for (let i = 0; i < bitmaps.length; i++) {
+      const bmp = bitmaps[i];
+      const dw  = Math.round(bmp.width  * scale);
+      const dh  = Math.round(bmp.height * scale);
+      if (i > 0) x -= ov;
+      if (isFade && i > 0 && ov > 0) {
+        // Fade: draw the incoming image with a left-to-right alpha ramp
+        const tmp = document.createElement('canvas');
+        tmp.width = dw; tmp.height = dh;
+        const tc  = tmp.getContext('2d');
+        tc.drawImage(bmp, 0, 0, dw, dh);
+        const grad = tc.createLinearGradient(0, 0, ov, 0);
+        grad.addColorStop(0, 'rgba(0,0,0,0)');
+        grad.addColorStop(1, 'rgba(0,0,0,1)');
+        tc.globalCompositeOperation = 'destination-in';
+        tc.fillStyle = grad;
+        tc.fillRect(0, 0, ov, dh);
+        ctx.drawImage(tmp, x, 0);
+      } else {
+        ctx.drawImage(bmp, x, 0, dw, dh);
+      }
+      x += dw;
+    }
+  } else {
+    let y = 0;
+    for (let i = 0; i < bitmaps.length; i++) {
+      const bmp = bitmaps[i];
+      const dw  = Math.round(bmp.width  * scale);
+      const dh  = Math.round(bmp.height * scale);
+      if (i > 0) y -= ov;
+      if (isFade && i > 0 && ov > 0) {
+        const tmp = document.createElement('canvas');
+        tmp.width = dw; tmp.height = dh;
+        const tc  = tmp.getContext('2d');
+        tc.drawImage(bmp, 0, 0, dw, dh);
+        const grad = tc.createLinearGradient(0, 0, 0, ov);
+        grad.addColorStop(0, 'rgba(0,0,0,0)');
+        grad.addColorStop(1, 'rgba(0,0,0,1)');
+        tc.globalCompositeOperation = 'destination-in';
+        tc.fillStyle = grad;
+        tc.fillRect(0, 0, dw, ov);
+        ctx.drawImage(tmp, 0, y);
+      } else {
+        ctx.drawImage(bmp, 0, y, dw, dh);
+      }
+      y += dh;
+    }
+  }
+
+  // Zoom view of seam edge (horizontal layouts only)
+  if (_zoomActive && direction === 'horizontal' && ov > 0) {
+    const dw0 = Math.round(bitmaps[0].width * scale);
+    _lastZoomParams = { cv, dw0, ov, cvW, cvH };
+    _renderZoomStrip(_lastZoomParams);
+  } else if (!_zoomActive) {
+    zoomPanel.style.display = 'none';
+  }
+
+  cv.toBlob(blob => {
+    if (!blob) return;
+    if (_previewObjectURL) URL.revokeObjectURL(_previewObjectURL);
+    _previewObjectURL = URL.createObjectURL(blob);
+    previewImg.onload = () => {
+      const landscape = cvW >= cvH;
+      appBody.classList.toggle('layout-side',  !landscape);
+      appBody.classList.toggle('layout-stack',  landscape);
+      appBody.classList.add('has-preview');
+    };
+    previewImg.src = _previewObjectURL;
+    statusEl.textContent = `${cells.length} images · ${overlap}px overlap`;
+  }, 'image/jpeg', 0.92);
+}
+
+let _livePreviewPending = false;
+function scheduleLivePreview() {
+  if (_livePreviewPending) return;
+  _livePreviewPending = true;
+  requestAnimationFrame(() => { _livePreviewPending = false; updateLivePreview(); });
+}
+
 stitchBtn.addEventListener('click', async () => {
   if (!hasImages()) return;
   processingEl.classList.add('visible');
@@ -1547,6 +2061,12 @@ stitchBtn.addEventListener('click', async () => {
       const msg = await res.text().catch(() => res.statusText);
       throw new Error(`Server error ${res.status}: ${msg}`);
     }
+    const appliedOverlap = res.headers.get('X-Overlap-Px');
+    if (appliedOverlap !== null) {
+      const px = parseInt(appliedOverlap, 10);
+      _setOverlapPx(px);
+      if (overlapIsAuto) overlapAutoBtn.classList.add('active');
+    }
     const blob = await res.blob();
     if (_previewObjectURL) URL.revokeObjectURL(_previewObjectURL);
     _previewObjectURL = URL.createObjectURL(blob);
@@ -1557,7 +2077,6 @@ stitchBtn.addEventListener('click', async () => {
       appBody.classList.add('has-preview');
     };
     previewImg.src = _previewObjectURL;
-    downloadBtn.href = _previewObjectURL;
     const kb = Math.round(blob.size / 1024);
     statusEl.textContent = `Stitched · ${kb} KB`;
   } catch (err) {
@@ -1569,12 +2088,33 @@ stitchBtn.addEventListener('click', async () => {
     stitchBtn.disabled = imgCount() < 2;
   }
 });
+
+downloadBtn.addEventListener('click', async e => {
+  e.preventDefault();
+  if (!hasImages()) return;
+  const prev = downloadBtn.textContent;
+  downloadBtn.textContent = 'Downloading…';
+  downloadBtn.style.pointerEvents = 'none';
+  try {
+    const res = await fetch('/stitch', { method: 'POST', body: _buildFormData() });
+    if (!res.ok) throw new Error(res.statusText);
+    const blob = await res.blob();
+    const url  = URL.createObjectURL(blob);
+    Object.assign(document.createElement('a'), { href: url, download: 'stitched.jpg' }).click();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+  } catch (err) {
+    statusEl.textContent = 'Download error: ' + err.message;
+  } finally {
+    downloadBtn.textContent = prev;
+    downloadBtn.style.pointerEvents = '';
+  }
+});
 </script>
 </body>
 </html>"""
 
 
-def _stitch_grid(layout, paths, td, fit=False):
+def _stitch_grid(layout, paths, td, fit=False, overlap=0, overlap_blend="hard"):
     """
     Composite a 2D grid of images into a single JPEG.
 
@@ -1641,9 +2181,27 @@ def _stitch_grid(layout, paths, td, fit=False):
                     if img is not None:
                         row_heights[r] = max(row_heights[r], img.height)
 
-    total_w = sum(col_widths)
-    total_h = sum(row_heights)
-    if total_w == 0 or total_h == 0:
+    # Clamp overlap to something sensible for 1D layouts
+    if overlap > 0:
+        if num_rows == 1 and num_cols > 1:
+            overlap = min(overlap, min(col_widths) - 1)
+        elif num_cols == 1 and num_rows > 1:
+            overlap = min(overlap, min(row_heights) - 1)
+        else:
+            overlap = 0  # non-1D grid: ignore overlap
+        overlap = max(0, overlap)
+
+    if overlap > 0 and num_rows == 1:
+        total_w = sum(col_widths) - overlap * (num_cols - 1)
+        total_h = row_heights[0] if row_heights else 0
+    elif overlap > 0 and num_cols == 1:
+        total_w = col_widths[0] if col_widths else 0
+        total_h = sum(row_heights) - overlap * (num_rows - 1)
+    else:
+        total_w = sum(col_widths)
+        total_h = sum(row_heights)
+
+    if total_w <= 0 or total_h <= 0:
         return None
 
     MAX_CANVAS_PX = 16384
@@ -1651,14 +2209,60 @@ def _stitch_grid(layout, paths, td, fit=False):
         return None
 
     canvas = Image.new("RGB", (total_w, total_h), (0, 0, 0))
-    y_off = 0
-    for r, row in enumerate(grid):
-        x_off = 0
-        for c, img in enumerate(row):
-            if img is not None:
-                canvas.paste(img, (x_off, y_off))
-            x_off += col_widths[c]
-        y_off += row_heights[r]
+
+    if overlap > 0 and num_rows == 1:
+        x = 0
+        for c in range(num_cols):
+            img = grid[0][c]
+            if img is None:
+                x += col_widths[c]
+                continue
+            if c > 0:
+                x -= overlap
+                if overlap_blend == "fade":
+                    blend_h    = min(img.height, canvas.height)
+                    left_crop  = canvas.crop((x, 0, x + overlap, blend_h))
+                    right_crop = img.crop((0, 0, overlap, blend_h))
+                    mask = _make_blend_mask(overlap, blend_h, "horizontal")
+                    canvas.paste(Image.composite(right_crop, left_crop, mask), (x, 0))
+                    if img.width > overlap:
+                        canvas.paste(img.crop((overlap, 0, img.width, img.height)), (x + overlap, 0))
+                else:
+                    canvas.paste(img, (x, 0))
+            else:
+                canvas.paste(img, (x, 0))
+            x += col_widths[c]
+    elif overlap > 0 and num_cols == 1:
+        y = 0
+        for r in range(num_rows):
+            img = grid[r][0]
+            if img is None:
+                y += row_heights[r]
+                continue
+            if r > 0:
+                y -= overlap
+                if overlap_blend == "fade":
+                    blend_w  = min(img.width, canvas.width)
+                    top_crop = canvas.crop((0, y, blend_w, y + overlap))
+                    bot_crop = img.crop((0, 0, blend_w, overlap))
+                    mask = _make_blend_mask(blend_w, overlap, "vertical")
+                    canvas.paste(Image.composite(bot_crop, top_crop, mask), (0, y))
+                    if img.height > overlap:
+                        canvas.paste(img.crop((0, overlap, img.width, img.height)), (0, y + overlap))
+                else:
+                    canvas.paste(img, (0, y))
+            else:
+                canvas.paste(img, (0, y))
+            y += row_heights[r]
+    else:
+        y_off = 0
+        for r, row in enumerate(grid):
+            x_off = 0
+            for c, img in enumerate(row):
+                if img is not None:
+                    canvas.paste(img, (x_off, y_off))
+                x_off += col_widths[c]
+            y_off += row_heights[r]
 
     output_path = os.path.join(td, "output.jpg")
     qtables, quality, subsampling, is_grayscale = _jpeg_params(first_path)
@@ -1726,6 +2330,9 @@ def _run_web_server(port=5001):
     def _stitch_to_buf():
         layout = _validate_layout()
         fit = request.form.get("fit", "false").lower() == "true"
+        overlap_raw   = request.form.get("overlap", "auto")
+        overlap_blend = request.form.get("overlap_blend", "hard")
+
         with tempfile.TemporaryDirectory() as td:
             paths = {}
             for key, f in request.files.items():
@@ -1735,22 +2342,48 @@ def _run_web_server(port=5001):
                 dest = os.path.join(td, safe_key + ext)
                 f.save(dest)
                 paths[key] = dest
-            output = _stitch_grid(layout, paths, td, fit=fit)
+
+            if overlap_raw == "auto":
+                n_rows = len(layout)
+                n_cols = max(len(r) for r in layout)
+                direction = "horizontal" if n_rows == 1 else "vertical"
+                imgs = []
+                for row in layout:
+                    for fid in row:
+                        if fid and fid in paths:
+                            try:
+                                imgs.append(
+                                    ImageOps.exif_transpose(Image.open(paths[fid])).convert("RGB")
+                                )
+                            except Exception:
+                                pass
+                overlap = _suggest_overlap(imgs, direction) if len(imgs) >= 2 else 0
+            else:
+                try:
+                    overlap = max(0, int(overlap_raw))
+                except (ValueError, TypeError):
+                    overlap = 0
+
+            output = _stitch_grid(layout, paths, td, fit=fit, overlap=overlap, overlap_blend=overlap_blend)
             if output is None:
                 abort(500, "Nothing to stitch")
             buf = io.BytesIO(open(output, "rb").read())
         buf.seek(0)
-        return buf
+        return buf, overlap, overlap_blend
 
     @app.route("/stitch", methods=["POST"])
     def stitch():
-        buf = _stitch_to_buf()
+        buf, _, __ = _stitch_to_buf()
         return send_file(buf, mimetype="image/jpeg", as_attachment=True, download_name="stitched.jpg")
 
     @app.route("/preview", methods=["POST"])
     def preview():
-        buf = _stitch_to_buf()
-        return send_file(buf, mimetype="image/jpeg", as_attachment=False)
+        from flask import make_response
+        buf, overlap, overlap_blend = _stitch_to_buf()
+        resp = make_response(send_file(buf, mimetype="image/jpeg", as_attachment=False))
+        resp.headers["X-Overlap-Px"]    = str(overlap)
+        resp.headers["X-Overlap-Blend"] = overlap_blend
+        return resp
 
     url = f"http://localhost:{port}"
     print(f"Image Stitcher → {url}  (Ctrl-C to quit)")
@@ -1791,6 +2424,10 @@ def main():
     parser.add_argument("--fit", action="store_true",
                         help="Resize images to share the layout dimension before stitching "
                              "(height for horizontal, width for vertical)")
+    parser.add_argument("--overlap", type=int, default=0, metavar="PX",
+                        help="Pixels to overlap between adjacent images (default: 0)")
+    parser.add_argument("--overlap-blend", choices=["hard", "fade"], default="hard",
+                        help="Overlap blend mode: hard=direct paste (default), fade=cross-fade")
     parser.add_argument("--web",  "-w", action="store_true",
                         help="Launch the drag-and-drop web UI in your browser")
     parser.add_argument("--port",       type=int, default=5001,
@@ -1813,7 +2450,11 @@ def main():
 
     # Defer output-path computation to concat_images to avoid opening
     # input files twice (once here for format detection, once for processing).
-    concat_images(args.images, args.output, direction, args.order, fit=args.fit)
+    if args.overlap < 0:
+        print("Error: --overlap must be >= 0", file=sys.stderr)
+        sys.exit(1)
+
+    concat_images(args.images, args.output, direction, args.order, fit=args.fit, overlap=args.overlap, overlap_blend=args.overlap_blend)
 
 
 if __name__ == "__main__":
