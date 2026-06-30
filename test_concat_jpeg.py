@@ -476,6 +476,172 @@ def shutil_which_jpegtran():
     return shutil.which("jpegtran") is not None
 
 
+# ── Tests: overlap stitching ──────────────────────────────────────────────────
+
+class TestMakeBlendMask:
+    def test_horizontal_gradient_endpoints(self):
+        """Horizontal mask goes from 0 (left) to 255 (right)."""
+        mask = cj._make_blend_mask(10, 4, "horizontal")
+        pix = mask.load()
+        assert pix[0, 0] == 0
+        assert pix[9, 0] == 255
+
+    def test_vertical_gradient_endpoints(self):
+        """Vertical mask goes from 0 (top) to 255 (bottom)."""
+        mask = cj._make_blend_mask(4, 10, "vertical")
+        pix = mask.load()
+        assert pix[0, 0] == 0
+        assert pix[0, 9] == 255
+
+    def test_width_one_no_division_by_zero(self):
+        """w=1 (boundary: denom would be 0) does not crash."""
+        mask = cj._make_blend_mask(1, 5, "horizontal")
+        assert mask.size == (1, 5)
+
+    def test_height_one_no_division_by_zero(self):
+        """h=1 (boundary: denom would be 0) does not crash."""
+        mask = cj._make_blend_mask(5, 1, "vertical")
+        assert mask.size == (5, 1)
+
+
+class TestSuggestOverlap:
+    def test_fallback_without_numpy(self):
+        """Without numpy, falls back to ~10% of the join dimension."""
+        a = Image.new("RGB", (200, 100), (255, 0, 0))
+        b = Image.new("RGB", (200, 100), (0, 255, 0))
+        with patch.object(cj, "_HAS_NUMPY", False):
+            overlap = cj._suggest_overlap([a, b], "horizontal")
+        assert overlap == max(30, round(200 * 0.10))
+
+    def test_fewer_than_two_images_returns_fallback(self):
+        """Failure case: a single image still returns a sane fallback, no crash."""
+        a = Image.new("RGB", (200, 100), (255, 0, 0))
+        overlap = cj._suggest_overlap([a], "horizontal")
+        assert overlap == max(30, round(200 * 0.10))
+
+    @pytest.mark.skipif(not cj._HAS_NUMPY, reason="numpy not installed")
+    def test_returns_value_within_bounds(self):
+        """With numpy, suggested overlap stays within [0, 30% of join dim]."""
+        a = Image.new("RGB", (200, 100), (10, 10, 10))
+        b = Image.new("RGB", (200, 100), (240, 240, 240))
+        overlap = cj._suggest_overlap([a, b], "horizontal")
+        assert 0 <= overlap <= round(200 * 0.30)
+
+
+class TestOverlapConcat:
+    def test_overlap_reduces_output_width(self, tmpdir):
+        """Horizontal overlap shrinks total width vs plain concatenation."""
+        a = Image.new("RGB", (100, 50), (255, 0, 0))
+        b = Image.new("RGB", (100, 50), (0, 255, 0))
+        path_a = os.path.join(tmpdir, "a.jpg")
+        path_b = os.path.join(tmpdir, "b.jpg")
+        a.save(path_a, "JPEG", quality=90)
+        b.save(path_b, "JPEG", quality=90)
+
+        output = os.path.join(tmpdir, "out.jpg")
+        cj.concat_images([path_a, path_b], output, direction="horizontal",
+                          order="as-given", overlap=20)
+        result = Image.open(output)
+        assert result.size == (180, 50)  # 100+100-20 wide
+
+    def test_overlap_clamped_to_min_join_dim(self, tmpdir, capsys):
+        """Boundary: overlap >= the smallest join dimension gets clamped, with a warning."""
+        a = Image.new("RGB", (40, 50), (255, 0, 0))
+        b = Image.new("RGB", (100, 50), (0, 255, 0))
+        path_a = os.path.join(tmpdir, "a.jpg")
+        path_b = os.path.join(tmpdir, "b.jpg")
+        a.save(path_a, "JPEG", quality=90)
+        b.save(path_b, "JPEG", quality=90)
+
+        output = os.path.join(tmpdir, "out.jpg")
+        cj.concat_images([path_a, path_b], output, direction="horizontal",
+                          order="as-given", overlap=40)
+        captured = capsys.readouterr()
+        assert "clamped" in captured.out
+        result = Image.open(output)
+        assert result.size == (101, 50)  # 40+100 - 39 (clamped to min_join_dim-1)
+
+    def test_fade_blend_differs_from_hard_blend(self, tmpdir):
+        """fade vs hard overlap_blend produce different pixel content at the seam."""
+        a = Image.new("RGB", (100, 50), (255, 0, 0))
+        b = Image.new("RGB", (100, 50), (0, 0, 255))
+        path_a = os.path.join(tmpdir, "a.jpg")
+        path_b = os.path.join(tmpdir, "b.jpg")
+        a.save(path_a, "JPEG", quality=90)
+        b.save(path_b, "JPEG", quality=90)
+
+        hard_out = os.path.join(tmpdir, "hard.jpg")
+        fade_out = os.path.join(tmpdir, "fade.jpg")
+        cj.concat_images([path_a, path_b], hard_out, direction="horizontal",
+                          order="as-given", overlap=20, overlap_blend="hard")
+        cj.concat_images([path_a, path_b], fade_out, direction="horizontal",
+                          order="as-given", overlap=20, overlap_blend="fade")
+
+        hard_px = Image.open(hard_out).convert("RGB").load()
+        fade_px = Image.open(fade_out).convert("RGB").load()
+        # Mid-overlap pixel: hard paste shows pure blue, fade shows a blend.
+        assert hard_px[90, 25] != fade_px[90, 25]
+
+    def test_zero_overlap_unaffected(self, tmpdir):
+        """overlap=0 (default) behaves exactly like plain concatenation."""
+        a = Image.new("RGB", (100, 50), (255, 0, 0))
+        b = Image.new("RGB", (100, 50), (0, 255, 0))
+        path_a = os.path.join(tmpdir, "a.jpg")
+        path_b = os.path.join(tmpdir, "b.jpg")
+        a.save(path_a, "JPEG", quality=90)
+        b.save(path_b, "JPEG", quality=90)
+
+        output = os.path.join(tmpdir, "out.jpg")
+        cj.concat_images([path_a, path_b], output, direction="horizontal",
+                          order="as-given", overlap=0)
+        result = Image.open(output)
+        assert result.size == (200, 50)
+
+
+class TestStitchGrid:
+    def _save(self, tmpdir, name, size, color):
+        path = os.path.join(tmpdir, name)
+        Image.new("RGB", size, color).save(path, "JPEG", quality=90)
+        return path
+
+    def test_single_row_overlap(self, tmpdir):
+        """1xN grid: overlap shrinks total width and is echoed back unchanged."""
+        path_a = self._save(tmpdir, "a.jpg", (100, 50), (255, 0, 0))
+        path_b = self._save(tmpdir, "b.jpg", (100, 50), (0, 255, 0))
+        paths = {"a": path_a, "b": path_b}
+        out, applied_overlap = cj._stitch_grid([["a", "b"]], paths, str(tmpdir), overlap=20)
+        assert out is not None
+        assert applied_overlap == 20
+        result = Image.open(out)
+        assert result.size == (180, 50)
+
+    def test_non_1d_grid_ignores_overlap(self, tmpdir):
+        """Boundary: a 2x2 grid silently drops overlap (non-1D shape) instead of crashing,
+        and reports the actually-applied overlap (0) rather than the requested one."""
+        paths = {k: self._save(tmpdir, f"{k}.jpg", (40, 40), (10, 10, 10)) for k in "abcd"}
+        out, applied_overlap = cj._stitch_grid([["a", "b"], ["c", "d"]], paths, str(tmpdir), overlap=20)
+        assert out is not None
+        assert applied_overlap == 0
+        result = Image.open(out)
+        assert result.size == (80, 80)  # overlap ignored, plain 2x2 grid
+
+    def test_preopened_images_used_instead_of_reopening(self, tmpdir):
+        """preopened images are reused rather than re-decoded from disk."""
+        path_a = self._save(tmpdir, "a.jpg", (100, 50), (255, 0, 0))
+        path_b = self._save(tmpdir, "b.jpg", (100, 50), (0, 255, 0))
+        paths = {"a": path_a, "b": path_b}
+        preopened = {
+            "a": Image.open(path_a).convert("RGB"),
+            "b": Image.open(path_b).convert("RGB"),
+        }
+        # exif_transpose is only called on the decode-from-disk path in
+        # _stitch_grid; if preopened images are used it should never run.
+        with patch.object(cj.ImageOps, "exif_transpose", side_effect=AssertionError("should not re-decode")) as mock_transpose:
+            out, _ = cj._stitch_grid([["a", "b"]], paths, str(tmpdir), overlap=0, preopened=preopened)
+        mock_transpose.assert_not_called()
+        assert out is not None
+
+
 # ── Tests: CLI entry point ────────────────────────────────────────────────────
 
 class TestMain:

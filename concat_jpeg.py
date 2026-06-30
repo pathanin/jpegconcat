@@ -332,6 +332,35 @@ def _make_blend_mask(w, h, direction):
         return col.resize((w, h), Image.NEAREST)
 
 
+def _paste_overlap(canvas, img, pos, overlap, overlap_blend, direction):
+    """Paste img onto canvas at pos, optionally cross-fading the leading
+    `overlap`-px band (along direction) with whatever is already on the
+    canvas there. Shared by concat_images and _stitch_grid.
+
+    overlap=0 (e.g. the first image in a sequence) always does a plain paste.
+    """
+    x, y = pos
+    if overlap > 0 and overlap_blend == "fade":
+        if direction == "horizontal":
+            blend_h   = min(img.height, canvas.height - y)
+            prev_crop = canvas.crop((x, y, x + overlap, y + blend_h))
+            new_crop  = img.crop((0, 0, overlap, blend_h))
+            mask      = _make_blend_mask(overlap, blend_h, "horizontal")
+            canvas.paste(Image.composite(new_crop, prev_crop, mask), (x, y))
+            if img.width > overlap:
+                canvas.paste(img.crop((overlap, 0, img.width, img.height)), (x + overlap, y))
+        else:
+            blend_w   = min(img.width, canvas.width - x)
+            prev_crop = canvas.crop((x, y, x + blend_w, y + overlap))
+            new_crop  = img.crop((0, 0, blend_w, overlap))
+            mask      = _make_blend_mask(blend_w, overlap, "vertical")
+            canvas.paste(Image.composite(new_crop, prev_crop, mask), (x, y))
+            if img.height > overlap:
+                canvas.paste(img.crop((0, overlap, img.width, img.height)), (x, y + overlap))
+    else:
+        canvas.paste(img, (x, y))
+
+
 def _suggest_overlap(imgs, direction):
     """
     Suggest an overlap in pixels by finding where the blend zone has the
@@ -609,6 +638,8 @@ def concat_images(image_paths, output_path=None, direction="auto", order="auto",
             overlap = max(0, min_join_dim - 1)
             print(f"Warning: overlap clamped to {overlap}px")
 
+    if overlap > 0:
+        print("Note: overlap disables the lossless jpegtran fast-path; re-encoding via Pillow.")
     lossless = overlap == 0 and _try_lossless(image_paths, images, input_formats, output_path, direction, qtables, subsampling, all_subsampling=all_subsampling)
 
     # ── Pillow re-encode fallback ─────────────────────────────────────────────
@@ -621,18 +652,7 @@ def concat_images(image_paths, output_path=None, direction="auto", order="auto",
             for i, img in enumerate(images):
                 if i > 0 and overlap > 0:
                     x -= overlap
-                    if overlap_blend == "fade":
-                        blend_h    = min(img.height, canvas.height)
-                        left_crop  = canvas.crop((x, 0, x + overlap, blend_h))
-                        right_crop = img.crop((0, 0, overlap, blend_h))
-                        mask = _make_blend_mask(overlap, blend_h, "horizontal")
-                        canvas.paste(Image.composite(right_crop, left_crop, mask), (x, 0))
-                        if img.width > overlap:
-                            canvas.paste(img.crop((overlap, 0, img.width, img.height)), (x + overlap, 0))
-                    else:
-                        canvas.paste(img, (x, 0))
-                else:
-                    canvas.paste(img, (x, 0))
+                _paste_overlap(canvas, img, (x, 0), overlap if i > 0 else 0, overlap_blend, "horizontal")
                 x += img.width
         else:
             total_w = max(img.width  for img in images)
@@ -642,18 +662,7 @@ def concat_images(image_paths, output_path=None, direction="auto", order="auto",
             for i, img in enumerate(images):
                 if i > 0 and overlap > 0:
                     y -= overlap
-                    if overlap_blend == "fade":
-                        blend_w    = min(img.width, canvas.width)
-                        top_crop   = canvas.crop((0, y, blend_w, y + overlap))
-                        bot_crop   = img.crop((0, 0, blend_w, overlap))
-                        mask = _make_blend_mask(blend_w, overlap, "vertical")
-                        canvas.paste(Image.composite(bot_crop, top_crop, mask), (0, y))
-                        if img.height > overlap:
-                            canvas.paste(img.crop((0, overlap, img.width, img.height)), (0, y + overlap))
-                    else:
-                        canvas.paste(img, (0, y))
-                else:
-                    canvas.paste(img, (0, y))
+                _paste_overlap(canvas, img, (0, y), overlap if i > 0 else 0, overlap_blend, "vertical")
                 y += img.height
 
         out_ext = os.path.splitext(output_path)[1].lower()
@@ -1650,7 +1659,11 @@ function render() {
   const n = imgCount();
   statusEl.textContent = `${n} image${n !== 1 ? 's' : ''} · ${rows}×${cols} grid`;
   stitchBtn.disabled = n < 2;
-  overlapCtrl.style.display = n >= 2 ? 'flex' : 'none';
+  // Overlap only applies to single-row or single-column grids — _stitch_grid
+  // silently zeroes it for any other shape, so don't show a control that
+  // would have no effect.
+  const overlapApplies = rows === 1 || cols === 1;
+  overlapCtrl.style.display = (n >= 2 && overlapApplies) ? 'flex' : 'none';
 }
 
 function buildCell(cell, r, c) {
@@ -2050,6 +2063,15 @@ function scheduleLivePreview() {
   requestAnimationFrame(() => { _livePreviewPending = false; updateLivePreview(); });
 }
 
+function _syncOverlapFromResponse(res) {
+  const appliedOverlap = res.headers.get('X-Overlap-Px');
+  if (appliedOverlap !== null) {
+    const px = parseInt(appliedOverlap, 10);
+    _setOverlapPx(px);
+    if (overlapIsAuto) overlapAutoBtn.classList.add('active');
+  }
+}
+
 stitchBtn.addEventListener('click', async () => {
   if (!hasImages()) return;
   processingEl.classList.add('visible');
@@ -2061,12 +2083,7 @@ stitchBtn.addEventListener('click', async () => {
       const msg = await res.text().catch(() => res.statusText);
       throw new Error(`Server error ${res.status}: ${msg}`);
     }
-    const appliedOverlap = res.headers.get('X-Overlap-Px');
-    if (appliedOverlap !== null) {
-      const px = parseInt(appliedOverlap, 10);
-      _setOverlapPx(px);
-      if (overlapIsAuto) overlapAutoBtn.classList.add('active');
-    }
+    _syncOverlapFromResponse(res);
     const blob = await res.blob();
     if (_previewObjectURL) URL.revokeObjectURL(_previewObjectURL);
     _previewObjectURL = URL.createObjectURL(blob);
@@ -2098,6 +2115,7 @@ downloadBtn.addEventListener('click', async e => {
   try {
     const res = await fetch('/stitch', { method: 'POST', body: _buildFormData() });
     if (!res.ok) throw new Error(res.statusText);
+    _syncOverlapFromResponse(res);
     const blob = await res.blob();
     const url  = URL.createObjectURL(blob);
     Object.assign(document.createElement('a'), { href: url, download: 'stitched.jpg' }).click();
@@ -2114,19 +2132,28 @@ downloadBtn.addEventListener('click', async e => {
 </html>"""
 
 
-def _stitch_grid(layout, paths, td, fit=False, overlap=0, overlap_blend="hard"):
+def _stitch_grid(layout, paths, td, fit=False, overlap=0, overlap_blend="hard", preopened=None):
     """
     Composite a 2D grid of images into a single JPEG.
 
-    layout  — 2D list of file IDs (strings) or None for empty cells
-    paths   — {id: absolute_path}
-    td      — temp directory for the output file
+    layout     — 2D list of file IDs (strings) or None for empty cells
+    paths      — {id: absolute_path}
+    td         — temp directory for the output file
+    preopened  — optional {id: Image} of already-decoded (EXIF-transposed, RGB)
+                 images, used instead of re-opening from paths to avoid a
+                 second full-resolution decode (e.g. after auto-overlap
+                 suggestion already opened them).
 
     Column widths = max image width per column.
     Row heights   = max image height per row.
     Empty cells   = black fill.
     Encoding params taken from the first non-None cell (top-left scan order).
+
+    Returns (output_path, applied_overlap) — applied_overlap reflects any
+    clamping or non-1D zeroing this function did to the requested overlap,
+    so callers can report what was actually used rather than what was asked for.
     """
+    preopened = preopened or {}
     first_path = None
     num_rows = len(layout)
     num_cols = max(len(r) for r in layout)
@@ -2141,7 +2168,7 @@ def _stitch_grid(layout, paths, td, fit=False, overlap=0, overlap_blend="hard"):
         grid_row = []
         for c, fid in enumerate(row):
             if fid and fid in paths:
-                img = ImageOps.exif_transpose(Image.open(paths[fid])).convert("RGB")
+                img = preopened.get(fid) or ImageOps.exif_transpose(Image.open(paths[fid])).convert("RGB")
                 if first_path is None:
                     first_path = paths[fid]
                 col_widths[c]  = max(col_widths[c],  img.width)
@@ -2152,7 +2179,7 @@ def _stitch_grid(layout, paths, td, fit=False, overlap=0, overlap_blend="hard"):
         grid.append(grid_row)
 
     if first_path is None:
-        return None
+        return None, 0
 
     if fit:
         if num_rows == 1:
@@ -2202,11 +2229,11 @@ def _stitch_grid(layout, paths, td, fit=False, overlap=0, overlap_blend="hard"):
         total_h = sum(row_heights)
 
     if total_w <= 0 or total_h <= 0:
-        return None
+        return None, 0
 
     MAX_CANVAS_PX = 16384
     if total_w > MAX_CANVAS_PX or total_h > MAX_CANVAS_PX:
-        return None
+        return None, 0
 
     canvas = Image.new("RGB", (total_w, total_h), (0, 0, 0))
 
@@ -2219,18 +2246,7 @@ def _stitch_grid(layout, paths, td, fit=False, overlap=0, overlap_blend="hard"):
                 continue
             if c > 0:
                 x -= overlap
-                if overlap_blend == "fade":
-                    blend_h    = min(img.height, canvas.height)
-                    left_crop  = canvas.crop((x, 0, x + overlap, blend_h))
-                    right_crop = img.crop((0, 0, overlap, blend_h))
-                    mask = _make_blend_mask(overlap, blend_h, "horizontal")
-                    canvas.paste(Image.composite(right_crop, left_crop, mask), (x, 0))
-                    if img.width > overlap:
-                        canvas.paste(img.crop((overlap, 0, img.width, img.height)), (x + overlap, 0))
-                else:
-                    canvas.paste(img, (x, 0))
-            else:
-                canvas.paste(img, (x, 0))
+            _paste_overlap(canvas, img, (x, 0), overlap if c > 0 else 0, overlap_blend, "horizontal")
             x += col_widths[c]
     elif overlap > 0 and num_cols == 1:
         y = 0
@@ -2241,18 +2257,7 @@ def _stitch_grid(layout, paths, td, fit=False, overlap=0, overlap_blend="hard"):
                 continue
             if r > 0:
                 y -= overlap
-                if overlap_blend == "fade":
-                    blend_w  = min(img.width, canvas.width)
-                    top_crop = canvas.crop((0, y, blend_w, y + overlap))
-                    bot_crop = img.crop((0, 0, blend_w, overlap))
-                    mask = _make_blend_mask(blend_w, overlap, "vertical")
-                    canvas.paste(Image.composite(bot_crop, top_crop, mask), (0, y))
-                    if img.height > overlap:
-                        canvas.paste(img.crop((0, overlap, img.width, img.height)), (0, y + overlap))
-                else:
-                    canvas.paste(img, (0, y))
-            else:
-                canvas.paste(img, (0, y))
+            _paste_overlap(canvas, img, (0, y), overlap if r > 0 else 0, overlap_blend, "vertical")
             y += row_heights[r]
     else:
         y_off = 0
@@ -2278,7 +2283,7 @@ def _stitch_grid(layout, paths, td, fit=False, overlap=0, overlap_blend="hard"):
     else:
         canvas.save(output_path, "JPEG", quality=quality, subsampling=subsampling)
 
-    return output_path
+    return output_path, overlap
 
 
 def _run_web_server(port=5001):
@@ -2330,7 +2335,10 @@ def _run_web_server(port=5001):
     def _stitch_to_buf():
         layout = _validate_layout()
         fit = request.form.get("fit", "false").lower() == "true"
-        overlap_raw   = request.form.get("overlap", "auto")
+        # Default "0" (no overlap) so callers that omit the field — anything
+        # other than the bundled UI, which always sends it explicitly — get
+        # plain concatenation rather than a silently auto-applied overlap.
+        overlap_raw   = request.form.get("overlap", "0")
         overlap_blend = request.form.get("overlap_blend", "hard")
 
         with tempfile.TemporaryDirectory() as td:
@@ -2343,20 +2351,21 @@ def _run_web_server(port=5001):
                 f.save(dest)
                 paths[key] = dest
 
+            # Decode each referenced image at most once, and hand the opened
+            # images straight to _stitch_grid so it doesn't re-decode them.
+            opened = {}
+            for row in layout:
+                for fid in row:
+                    if fid and fid in paths and fid not in opened:
+                        try:
+                            opened[fid] = ImageOps.exif_transpose(Image.open(paths[fid])).convert("RGB")
+                        except Exception:
+                            pass
+
             if overlap_raw == "auto":
                 n_rows = len(layout)
-                n_cols = max(len(r) for r in layout)
                 direction = "horizontal" if n_rows == 1 else "vertical"
-                imgs = []
-                for row in layout:
-                    for fid in row:
-                        if fid and fid in paths:
-                            try:
-                                imgs.append(
-                                    ImageOps.exif_transpose(Image.open(paths[fid])).convert("RGB")
-                                )
-                            except Exception:
-                                pass
+                imgs = [opened[fid] for row in layout for fid in row if fid in opened]
                 overlap = _suggest_overlap(imgs, direction) if len(imgs) >= 2 else 0
             else:
                 try:
@@ -2364,7 +2373,7 @@ def _run_web_server(port=5001):
                 except (ValueError, TypeError):
                     overlap = 0
 
-            output = _stitch_grid(layout, paths, td, fit=fit, overlap=overlap, overlap_blend=overlap_blend)
+            output, overlap = _stitch_grid(layout, paths, td, fit=fit, overlap=overlap, overlap_blend=overlap_blend, preopened=opened)
             if output is None:
                 abort(500, "Nothing to stitch")
             buf = io.BytesIO(open(output, "rb").read())
@@ -2373,8 +2382,12 @@ def _run_web_server(port=5001):
 
     @app.route("/stitch", methods=["POST"])
     def stitch():
-        buf, _, __ = _stitch_to_buf()
-        return send_file(buf, mimetype="image/jpeg", as_attachment=True, download_name="stitched.jpg")
+        from flask import make_response
+        buf, overlap, overlap_blend = _stitch_to_buf()
+        resp = make_response(send_file(buf, mimetype="image/jpeg", as_attachment=True, download_name="stitched.jpg"))
+        resp.headers["X-Overlap-Px"]    = str(overlap)
+        resp.headers["X-Overlap-Blend"] = overlap_blend
+        return resp
 
     @app.route("/preview", methods=["POST"])
     def preview():
