@@ -19,6 +19,7 @@ preserves EXIF from the first source image.
 """
 
 import argparse
+import io
 import os
 import re
 import shutil
@@ -132,6 +133,32 @@ def _jpeg_params(path):
 
         subsampling = _parse_sof_subsampling(raw)
         _img = Image.open(path)
+        is_grayscale = (_img.mode == "L")
+        if _img.quantization:
+            qtables = _img.quantization
+            tbl = qtables.get(0, [])
+            if len(tbl) == 64:
+                s = sum(tbl[k] * 100 / _STD_LUMA[k] for k in range(64)) / 64
+                q = (200 - s) / 2 if s <= 100 else 5000 / s
+                quality = max(1, min(95, round(q)))
+    except Exception:
+        pass
+
+    return qtables, quality, subsampling, is_grayscale
+
+
+def _jpeg_params_from_bytes(raw):
+    """Same as _jpeg_params, but from bytes already read into memory (avoids a
+    second disk read when the caller already has the raw bytes, e.g. because
+    it also needs them to decode pixels)."""
+    qtables = None
+    quality = 85
+    subsampling = 2
+    is_grayscale = False
+
+    try:
+        subsampling = _parse_sof_subsampling(raw)
+        _img = Image.open(io.BytesIO(raw))
         is_grayscale = (_img.mode == "L")
         if _img.quantization:
             qtables = _img.quantization
@@ -1388,6 +1415,8 @@ let dragSrc = null;
 let dragEnterCount = 0;
 let _rafPending = false;
 let _lastDragX = 0, _lastDragY = 0;
+let _cellDragoverRafPending = false;
+let _pendingCellDragover = null;
 
 const appBody       = document.getElementById('app-body');
 const dropZoneEl    = document.getElementById('drop-zone');
@@ -1480,6 +1509,8 @@ document.querySelectorAll('.zoom-level-btn').forEach(btn => {
 });
 
 let _zoomDragX = null, _zoomDragY = null;
+let _zoomMoveRafPending = false;
+let _lastZoomMoveX = 0, _lastZoomMoveY = 0;
 zoomCanvas.addEventListener('mousedown', e => {
   _zoomDragX = e.clientX;
   _zoomDragY = e.clientY;
@@ -1488,15 +1519,23 @@ zoomCanvas.addEventListener('mousedown', e => {
 });
 window.addEventListener('mousemove', e => {
   if (_zoomDragX === null) return;
-  const dx = e.clientX - _zoomDragX;
-  const dy = e.clientY - _zoomDragY;
-  _zoomDragX = e.clientX;
-  _zoomDragY = e.clientY;
-  if (_zoomOffsetX !== null) {
-    _zoomOffsetX = Math.round(_zoomOffsetX - dx / _zoomLevel);
-    _zoomOffsetY = Math.round(_zoomOffsetY - dy / _zoomLevel);
-  }
-  if (_lastZoomParams) _renderZoomStrip(_lastZoomParams);
+  _lastZoomMoveX = e.clientX;
+  _lastZoomMoveY = e.clientY;
+  if (_zoomMoveRafPending) return;
+  _zoomMoveRafPending = true;
+  requestAnimationFrame(() => {
+    _zoomMoveRafPending = false;
+    if (_zoomDragX === null) return;
+    const dx = _lastZoomMoveX - _zoomDragX;
+    const dy = _lastZoomMoveY - _zoomDragY;
+    _zoomDragX = _lastZoomMoveX;
+    _zoomDragY = _lastZoomMoveY;
+    if (_zoomOffsetX !== null) {
+      _zoomOffsetX = Math.round(_zoomOffsetX - dx / _zoomLevel);
+      _zoomOffsetY = Math.round(_zoomOffsetY - dy / _zoomLevel);
+    }
+    if (_lastZoomParams) _renderZoomStrip(_lastZoomParams);
+  });
 });
 window.addEventListener('mouseup', () => {
   if (_zoomDragX !== null) { _zoomDragX = null; _zoomDragY = null; zoomCanvas.style.cursor = 'grab'; }
@@ -1604,6 +1643,7 @@ async function applyTransform(r, c, type) {
   const blob = await new Promise(res => canvas.toBlob(res, 'image/jpeg', 0.92));
   const newFile = new File([blob], cell.name, { type: 'image/jpeg' });
   const thumbURL = await makeThumbnail(newFile);
+  delete _bitmapCache[cell.id];
   grid[r][c] = { ...cell, dataURL: thumbURL, file: newFile };
   render();
 }
@@ -1721,7 +1761,17 @@ function buildCell(cell, r, c) {
   });
   el.addEventListener('dragover', e => {
     e.preventDefault();
-    if (dragSrc) activateZone(overlay, zoneAt(e.clientX, e.clientY, el));
+    if (!dragSrc) return;
+    _pendingCellDragover = { overlay, clientX: e.clientX, clientY: e.clientY, el };
+    if (_cellDragoverRafPending) return;
+    _cellDragoverRafPending = true;
+    requestAnimationFrame(() => {
+      _cellDragoverRafPending = false;
+      if (!_pendingCellDragover) return;
+      const p = _pendingCellDragover;
+      _pendingCellDragover = null;
+      activateZone(p.overlay, zoneAt(p.clientX, p.clientY, p.el));
+    });
   });
   el.addEventListener('dragleave', e => {
     if (dragSrc && !el.contains(e.relatedTarget)) deactivateZone(overlay);
@@ -2132,29 +2182,38 @@ downloadBtn.addEventListener('click', async e => {
 </html>"""
 
 
-def _stitch_grid(layout, paths, td, fit=False, overlap=0, overlap_blend="hard", preopened=None):
+def _stitch_grid(layout, paths, td, fit=False, overlap=0, overlap_blend="hard", preopened=None, preopened_params=None):
     """
     Composite a 2D grid of images into a single JPEG.
 
     layout     — 2D list of file IDs (strings) or None for empty cells
     paths      — {id: absolute_path}
-    td         — temp directory for the output file
+    td         — temp directory used for input staging by the caller (kept for
+                 signature compatibility; the output is produced in memory)
     preopened  — optional {id: Image} of already-decoded (EXIF-transposed, RGB)
                  images, used instead of re-opening from paths to avoid a
                  second full-resolution decode (e.g. after auto-overlap
                  suggestion already opened them).
+    preopened_params — optional {id: (qtables, quality, subsampling, is_grayscale)}
+                 precomputed via _jpeg_params_from_bytes while the caller
+                 already had the raw bytes in hand, so this function doesn't
+                 need to re-read the first cell's file from disk.
 
     Column widths = max image width per column.
     Row heights   = max image height per row.
     Empty cells   = black fill.
     Encoding params taken from the first non-None cell (top-left scan order).
 
-    Returns (output_path, applied_overlap) — applied_overlap reflects any
-    clamping or non-1D zeroing this function did to the requested overlap,
-    so callers can report what was actually used rather than what was asked for.
+    Returns (output_buffer, applied_overlap) — output_buffer is a BytesIO
+    positioned at 0, or None if there was nothing to stitch. applied_overlap
+    reflects any clamping or non-1D zeroing this function did to the
+    requested overlap, so callers can report what was actually used rather
+    than what was asked for.
     """
     preopened = preopened or {}
+    preopened_params = preopened_params or {}
     first_path = None
+    first_fid = None
     num_rows = len(layout)
     num_cols = max(len(r) for r in layout)
     for row in layout:
@@ -2171,6 +2230,7 @@ def _stitch_grid(layout, paths, td, fit=False, overlap=0, overlap_blend="hard", 
                 img = preopened.get(fid) or ImageOps.exif_transpose(Image.open(paths[fid])).convert("RGB")
                 if first_path is None:
                     first_path = paths[fid]
+                    first_fid = fid
                 col_widths[c]  = max(col_widths[c],  img.width)
                 row_heights[r] = max(row_heights[r], img.height)
                 grid_row.append(img)
@@ -2181,32 +2241,34 @@ def _stitch_grid(layout, paths, td, fit=False, overlap=0, overlap_blend="hard", 
     if first_path is None:
         return None, 0
 
+    # Compute fit's target dimensions up front (cheap arithmetic) so the
+    # oversize-canvas check below can reject requests before any LANCZOS
+    # resampling runs. The actual resize happens later, after that check.
+    fit_new_w = None  # per-column new width, horizontal fit only
+    fit_new_h = None  # per-cell new height matrix, vertical fit only
     if fit:
         if num_rows == 1:
             # Single-row horizontal: scale each image to the tallest row height
             target_h = row_heights[0]
+            fit_new_w = [0] * num_cols
             for c, img in enumerate(grid[0]):
-                if img is not None and img.height != target_h:
-                    new_w = round(img.width * target_h / img.height)
-                    grid[0][c] = img.resize((new_w, target_h), Image.LANCZOS)
-            col_widths = [
-                grid[0][c].width if grid[0][c] is not None else 0
-                for c in range(num_cols)
-            ]
+                if img is not None:
+                    fit_new_w[c] = (
+                        round(img.width * target_h / img.height) if img.height != target_h else img.width
+                    )
+            col_widths = list(fit_new_w)
         else:
             # Vertical single-column or multi-row grid: scale each image to its column width
+            fit_new_h = [[None] * num_cols for _ in range(num_rows)]
+            new_row_heights = [0] * num_rows
             for r, row in enumerate(grid):
                 for c, img in enumerate(row):
                     if img is not None:
                         target_w = col_widths[c]
-                        if img.width != target_w:
-                            new_h = round(img.height * target_w / img.width)
-                            grid[r][c] = img.resize((target_w, new_h), Image.LANCZOS)
-            row_heights = [0] * num_rows
-            for r, row in enumerate(grid):
-                for c, img in enumerate(row):
-                    if img is not None:
-                        row_heights[r] = max(row_heights[r], img.height)
+                        h = round(img.height * target_w / img.width) if img.width != target_w else img.height
+                        fit_new_h[r][c] = h
+                        new_row_heights[r] = max(new_row_heights[r], h)
+            row_heights = new_row_heights
 
     # Clamp overlap to something sensible for 1D layouts
     if overlap > 0:
@@ -2234,6 +2296,20 @@ def _stitch_grid(layout, paths, td, fit=False, overlap=0, overlap_blend="hard", 
     MAX_CANVAS_PX = 16384
     if total_w > MAX_CANVAS_PX or total_h > MAX_CANVAS_PX:
         return None, 0
+
+    # Now that the request has cleared the oversize check, actually perform
+    # the fit resampling using the dimensions computed above.
+    if fit:
+        if num_rows == 1:
+            target_h = row_heights[0]
+            for c, img in enumerate(grid[0]):
+                if img is not None and img.height != target_h:
+                    grid[0][c] = img.resize((fit_new_w[c], target_h), Image.LANCZOS)
+        else:
+            for r, row in enumerate(grid):
+                for c, img in enumerate(row):
+                    if img is not None and img.width != col_widths[c]:
+                        grid[r][c] = img.resize((col_widths[c], fit_new_h[r][c]), Image.LANCZOS)
 
     canvas = Image.new("RGB", (total_w, total_h), (0, 0, 0))
 
@@ -2269,21 +2345,25 @@ def _stitch_grid(layout, paths, td, fit=False, overlap=0, overlap_blend="hard", 
                 x_off += col_widths[c]
             y_off += row_heights[r]
 
-    output_path = os.path.join(td, "output.jpg")
-    qtables, quality, subsampling, is_grayscale = _jpeg_params(first_path)
+    if first_fid in preopened_params:
+        qtables, quality, subsampling, is_grayscale = preopened_params[first_fid]
+    else:
+        qtables, quality, subsampling, is_grayscale = _jpeg_params(first_path)
 
+    output_buf = io.BytesIO()
     if is_grayscale:
         canvas = canvas.convert("L")
         if qtables:
-            canvas.save(output_path, "JPEG", qtables=qtables)
+            canvas.save(output_buf, "JPEG", qtables=qtables)
         else:
-            canvas.save(output_path, "JPEG", quality=quality)
+            canvas.save(output_buf, "JPEG", quality=quality)
     elif qtables:
-        canvas.save(output_path, "JPEG", qtables=qtables, subsampling=subsampling)
+        canvas.save(output_buf, "JPEG", qtables=qtables, subsampling=subsampling)
     else:
-        canvas.save(output_path, "JPEG", quality=quality, subsampling=subsampling)
+        canvas.save(output_buf, "JPEG", quality=quality, subsampling=subsampling)
 
-    return output_path, overlap
+    output_buf.seek(0)
+    return output_buf, overlap
 
 
 def _run_web_server(port=5001):
@@ -2296,7 +2376,7 @@ def _run_web_server(port=5001):
         )
         sys.exit(1)
 
-    import io, json as _json, threading, webbrowser
+    import json as _json, threading, webbrowser
     from flask import Flask, abort, request, send_file
 
     app = Flask(__name__)
@@ -2353,12 +2433,19 @@ def _run_web_server(port=5001):
 
             # Decode each referenced image at most once, and hand the opened
             # images straight to _stitch_grid so it doesn't re-decode them.
+            # Also extract JPEG encoding params from the same raw bytes used
+            # for the decode, so _stitch_grid doesn't need a second disk read
+            # of whichever image ends up being "first" in scan order.
             opened = {}
+            opened_params = {}
             for row in layout:
                 for fid in row:
                     if fid and fid in paths and fid not in opened:
                         try:
-                            opened[fid] = ImageOps.exif_transpose(Image.open(paths[fid])).convert("RGB")
+                            with open(paths[fid], "rb") as fh:
+                                raw = fh.read()
+                            opened_params[fid] = _jpeg_params_from_bytes(raw)
+                            opened[fid] = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
                         except Exception:
                             pass
 
@@ -2373,11 +2460,12 @@ def _run_web_server(port=5001):
                 except (ValueError, TypeError):
                     overlap = 0
 
-            output, overlap = _stitch_grid(layout, paths, td, fit=fit, overlap=overlap, overlap_blend=overlap_blend, preopened=opened)
-            if output is None:
+            buf, overlap = _stitch_grid(
+                layout, paths, td, fit=fit, overlap=overlap, overlap_blend=overlap_blend,
+                preopened=opened, preopened_params=opened_params,
+            )
+            if buf is None:
                 abort(500, "Nothing to stitch")
-            buf = io.BytesIO(open(output, "rb").read())
-        buf.seek(0)
         return buf, overlap, overlap_blend
 
     @app.route("/stitch", methods=["POST"])
@@ -2407,7 +2495,7 @@ def _run_web_server(port=5001):
     threading.Thread(target=_open, daemon=True).start()
 
     try:
-        app.run(debug=False, port=port)
+        app.run(debug=False, port=port, threaded=True)
     except OSError as exc:
         if "Address already in use" in str(exc):
             print(f"Port {port} is in use. Try: jpegconcat --web --port {port + 1}")
