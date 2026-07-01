@@ -2192,6 +2192,11 @@ stitchBtn.addEventListener('click', async () => {
     }
     _syncOverlapFromResponse(res);
     const blob = await res.blob();
+    // A deferred client-side publish (from _scheduleCanvasPublish's trailing
+    // edge) could otherwise land after this and overwrite the server result
+    // with the lower-res client composite.
+    if (_previewPublishTimer) { clearTimeout(_previewPublishTimer); _previewPublishTimer = null; }
+    _pendingPreviewPublish = null;
     if (_previewObjectURL) URL.revokeObjectURL(_previewObjectURL);
     _previewObjectURL = URL.createObjectURL(blob);
     previewImg.onload = () => {
