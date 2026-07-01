@@ -1602,8 +1602,12 @@ function swapCells(r1, c1, r2, c2) {
   [grid[r1][c1], grid[r2][c2]] = [grid[r2][c2], grid[r1][c1]];
 }
 
+// Returns true when the grid's row/col shape is unchanged (a plain swap),
+// so the caller can patch just the two affected cells instead of a full
+// render(); returns false when rows/cols were inserted or removed and a
+// full render() is required.
 function moveCellToZone(srcR, srcC, dstR, dstC, zone) {
-  if (zone === 'center') { swapCells(srcR, srcC, dstR, dstC); return; }
+  if (zone === 'center') { swapCells(srcR, srcC, dstR, dstC); return true; }
   const srcCell = grid[srcR][srcC];
   const dstCell = grid[dstR][dstC];
   grid[srcR][srcC] = null;
@@ -1613,11 +1617,12 @@ function moveCellToZone(srcR, srcC, dstR, dstC, zone) {
   outer: for (let r = 0; r < grid.length; r++)
     for (let c = 0; c < grid[r].length; c++)
       if (grid[r][c] === dstCell) { nr = r; nc = c; break outer; }
-  if (nr === -1) { grid.push([srcCell]); return; }
+  if (nr === -1) { grid.push([srcCell]); return false; }
   if (zone === 'left')   { insertCol(nc - 1); grid[nr][nc]     = srcCell; }
   else if (zone === 'right')  { insertCol(nc);     grid[nr][nc + 1] = srcCell; }
   else if (zone === 'top')    { insertRow(nr - 1); grid[nr][nc]     = srcCell; }
   else if (zone === 'bottom') { insertRow(nr);     grid[nr + 1][nc] = srcCell; }
+  return false;
 }
 
 async function applyTransform(r, c, type) {
@@ -1645,7 +1650,21 @@ async function applyTransform(r, c, type) {
   const thumbURL = await makeThumbnail(newFile);
   delete _bitmapCache[cell.id];
   grid[r][c] = { ...cell, dataURL: thumbURL, file: newFile };
-  render();
+  updateCellInPlace(r, c);
+}
+
+// Patches a single cell's thumbnail <img> in place instead of tearing down
+// and rebuilding the whole grid (which forces the browser to re-layout and
+// re-decode every other cell's thumbnail too). Only valid when the cell's
+// position and the grid's shape haven't changed — falls back to a full
+// render() if the expected element isn't found.
+function updateCellInPlace(r, c) {
+  const cell = grid[r][c];
+  if (!cell) { render(); return; }
+  const img = gridEl.querySelector(`.cell[data-r="${r}"][data-c="${c}"] img`);
+  if (!img) { render(); return; }
+  img.src = cell.dataURL;
+  img.alt = cell.name;
 }
 
 async function makeCells(files) {
@@ -1782,7 +1801,11 @@ function buildCell(cell, r, c) {
     if (e.dataTransfer.files.length) return;
     if (!dragSrc) return;
     const { r: sr, c: sc } = dragSrc;
-    if (sr !== r || sc !== c) { moveCellToZone(sr, sc, r, c, zoneAt(e.clientX, e.clientY, el)); render(); }
+    if (sr !== r || sc !== c) {
+      const sameShape = moveCellToZone(sr, sc, r, c, zoneAt(e.clientX, e.clientY, el));
+      if (sameShape) { updateCellInPlace(sr, sc); updateCellInPlace(r, c); }
+      else render();
+    }
   });
 
   return el;
@@ -2091,6 +2114,21 @@ async function updateLivePreview() {
     zoomPanel.style.display = 'none';
   }
 
+  _scheduleCanvasPublish(cv, cvW, cvH, cells.length, overlap);
+}
+
+// Publishing the composited canvas to <img> requires a JPEG encode
+// (cv.toBlob) followed by a browser JPEG decode (previewImg.src load).
+// That's cheap once, but updateLivePreview's caller (scheduleLivePreview)
+// re-runs on every rAF tick while a slider is being dragged, so publishing
+// is throttled to a fixed interval with a trailing-edge flush — the
+// composite itself (and the zoom-strip redraw) still happens every frame.
+const PREVIEW_PUBLISH_INTERVAL_MS = 80;
+let _lastPreviewPublishTime = 0;
+let _previewPublishTimer = null;
+let _pendingPreviewPublish = null;
+
+function _publishPreviewCanvas({ cv, cvW, cvH, cellCount, overlap }) {
   cv.toBlob(blob => {
     if (!blob) return;
     if (_previewObjectURL) URL.revokeObjectURL(_previewObjectURL);
@@ -2102,8 +2140,27 @@ async function updateLivePreview() {
       appBody.classList.add('has-preview');
     };
     previewImg.src = _previewObjectURL;
-    statusEl.textContent = `${cells.length} images · ${overlap}px overlap`;
+    statusEl.textContent = `${cellCount} images · ${overlap}px overlap`;
   }, 'image/jpeg', 0.92);
+}
+
+function _scheduleCanvasPublish(cv, cvW, cvH, cellCount, overlap) {
+  _pendingPreviewPublish = { cv, cvW, cvH, cellCount, overlap };
+  const elapsed = performance.now() - _lastPreviewPublishTime;
+  if (elapsed >= PREVIEW_PUBLISH_INTERVAL_MS) {
+    _lastPreviewPublishTime = performance.now();
+    const data = _pendingPreviewPublish;
+    _pendingPreviewPublish = null;
+    _publishPreviewCanvas(data);
+  } else if (!_previewPublishTimer) {
+    _previewPublishTimer = setTimeout(() => {
+      _previewPublishTimer = null;
+      _lastPreviewPublishTime = performance.now();
+      const data = _pendingPreviewPublish;
+      _pendingPreviewPublish = null;
+      if (data) _publishPreviewCanvas(data);
+    }, PREVIEW_PUBLISH_INTERVAL_MS - elapsed);
+  }
 }
 
 let _livePreviewPending = false;
