@@ -969,7 +969,7 @@ h1 {
   position: relative;
 }
 
-#preview-img {
+#preview-img, #preview-live {
   position: absolute;
   inset: 0;
   width: 100%;
@@ -1470,6 +1470,7 @@ h1 {
   <div id="preview-pane">
     <div id="preview-img-wrap">
       <img id="preview-img" alt="Stitched preview">
+      <canvas id="preview-live" aria-label="Live preview" style="display:none"></canvas>
     </div>
     <div id="zoom-panel" style="display:none;margin-top:6px">
       <canvas id="zoom-canvas" style="width:100%;display:block;image-rendering:pixelated;border-radius:5px;background:#2c2c2e;cursor:grab"></canvas>
@@ -1519,6 +1520,7 @@ const stitchBtn     = document.getElementById('stitch-btn');
 const statusEl      = document.getElementById('status');
 const processingEl  = document.getElementById('processing');
 const previewImg    = document.getElementById('preview-img');
+const previewLive   = document.getElementById('preview-live');
 const downloadBtn   = document.getElementById('download-btn');
 const overlapCtrl   = document.getElementById('overlap-control');
 const overlapSlider = document.getElementById('overlap-slider');
@@ -1631,15 +1633,31 @@ window.addEventListener('mouseup', () => {
 
 const uid = () => Math.random().toString(36).slice(2, 9);
 
+// Thumbnails are blob: URLs rather than base64 data: URLs — toBlob encodes
+// off the main thread and the DOM doesn't carry ~100 KB attribute strings.
+// Each cell owns its URL; _disposeCell revokes it.
+async function _thumbFromSource(src, maxPx) {
+  const scale = Math.min(1, maxPx / Math.max(src.width, src.height));
+  const w = Math.max(1, Math.round(src.width * scale));
+  const h = Math.max(1, Math.round(src.height * scale));
+  const cv = Object.assign(document.createElement('canvas'), { width: w, height: h });
+  cv.getContext('2d').drawImage(src, 0, 0, w, h);
+  const blob = await new Promise(res => cv.toBlob(res, 'image/jpeg', 0.75));
+  return URL.createObjectURL(blob);
+}
+
 async function makeThumbnail(file, maxPx = 400) {
   const bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' });
-  const scale = Math.min(1, maxPx / Math.max(bitmap.width, bitmap.height));
-  const w = Math.max(1, Math.round(bitmap.width * scale));
-  const h = Math.max(1, Math.round(bitmap.height * scale));
-  const cv = Object.assign(document.createElement('canvas'), { width: w, height: h });
-  cv.getContext('2d').drawImage(bitmap, 0, 0, w, h);
-  bitmap.close();
-  return cv.toDataURL('image/jpeg', 0.75);
+  try { return await _thumbFromSource(bitmap, maxPx); }
+  finally { bitmap.close(); }
+}
+
+// Releases everything a cell owns (thumbnail URL, cached preview bitmap).
+// Call whenever a cell object is dropped from the grid or replaced.
+function _disposeCell(cell) {
+  if (!cell) return;
+  _evictBitmap(cell.id);
+  if (cell.dataURL && cell.dataURL.startsWith('blob:')) URL.revokeObjectURL(cell.dataURL);
 }
 
 const nRows     = () => grid.length;
@@ -1665,8 +1683,7 @@ function insertRow(after) {
 }
 
 function removeCell(r, c) {
-  const cell = grid[r][c];
-  if (cell) delete _bitmapCache[cell.id];
+  _disposeCell(grid[r][c]);
   grid[r][c] = null;
   compact();
 }
@@ -1716,11 +1733,7 @@ function moveCellToZone(srcR, srcC, dstR, dstC, zone) {
 async function applyTransform(r, c, type) {
   const cell = grid[r][c];
   if (!cell) return;
-  const objURL = URL.createObjectURL(cell.file);
-  const img = new Image();
-  img.src = objURL;
-  await new Promise((res, rej) => { img.onload = res; img.onerror = rej; });
-  URL.revokeObjectURL(objURL);
+  const img = await createImageBitmap(cell.file, { imageOrientation: 'from-image' });
   const rotate = type === 'rotate-cw' || type === 'rotate-ccw';
   const canvas = document.createElement('canvas');
   canvas.width  = rotate ? img.height : img.width;
@@ -1733,11 +1746,23 @@ async function applyTransform(r, c, type) {
   else if (type === 'flip-v')     { ctx.translate(0, canvas.height); ctx.scale( 1, -1); }
   ctx.drawImage(img, 0, 0);
   ctx.restore();
-  const blob = await new Promise(res => canvas.toBlob(res, 'image/jpeg', 0.92));
+  img.close();
+  // The thumbnail comes straight from the transformed canvas rather than
+  // re-decoding the freshly encoded JPEG.
+  const [blob, thumbURL] = await Promise.all([
+    new Promise(res => canvas.toBlob(res, 'image/jpeg', 0.92)),
+    _thumbFromSource(canvas, 400),
+  ]);
   const newFile = new File([blob], cell.name, { type: 'image/jpeg' });
-  const thumbURL = await makeThumbnail(newFile);
-  delete _bitmapCache[cell.id];
-  grid[r][c] = { ...cell, dataURL: thumbURL, file: newFile };
+  // The grid may have changed while we were encoding; only patch if this
+  // cell is still where it was.
+  if (grid[r] && grid[r][c] === cell) {
+    _disposeCell(cell);
+    grid[r][c] = { ...cell, dataURL: thumbURL, file: newFile };
+  } else {
+    URL.revokeObjectURL(thumbURL);
+    return;
+  }
   updateCellInPlace(r, c);
 }
 
@@ -1757,14 +1782,20 @@ function updateCellInPlace(r, c) {
 
 async function makeCells(files) {
   const imgs = [...files].filter(f => f.type.startsWith('image/'));
-  return Promise.all(imgs.map(async f => ({
+  const cells = await Promise.all(imgs.map(async f => ({
     id: uid(), name: f.name, file: f, dataURL: await makeThumbnail(f),
   })));
+  // Warm the live-preview bitmaps in the background so the first slider
+  // drag doesn't stall on full-resolution decodes. Costs a little memory
+  // and idle CPU right after adding images, in exchange for smoothness.
+  for (const cell of cells) _getBitmap(cell).catch(() => {});
+  return cells;
 }
 
 async function initFromFiles(files) {
   const cells = await makeCells(files);
   if (!cells.length) return;
+  for (const row of grid) for (const old of row) _disposeCell(old);
   grid = [cells];
   render();
 }
@@ -1774,6 +1805,7 @@ async function dropFilesOnCell(r, c, zone, files) {
   if (!cells.length) return;
   const first = cells[0];
   if (zone === 'center') {
+    _disposeCell(grid[r][c]);
     grid[r][c] = first;
     for (let i = 1; i < cells.length; i++) { insertCol(c + i - 1); grid[r][c + i] = cells[i]; }
   } else if (zone === 'right')  { insertCol(c);     grid[r][c + 1] = first; }
@@ -2053,6 +2085,33 @@ function _buildFormData() {
 
 let _previewObjectURL = null;
 
+// The last full-resolution result from the server, keyed on everything that
+// feeds _buildFormData. Download reuses it instead of re-uploading every
+// image and re-stitching an identical JPEG. (Never the client-side live
+// composite — that one is downscaled.)
+let _lastServerResult = null;  // { key, files, blob }
+
+function _requestSignature() {
+  const files = [];
+  const layoutIds = grid.map(row => row.map(cell => {
+    if (cell) files.push(cell.file);
+    return cell ? cell.id : null;
+  }));
+  const key = JSON.stringify([
+    layoutIds,
+    document.getElementById('fit-toggle').checked,
+    overlapIsAuto ? 'auto' : overlapSlider.value,
+    overlapFadeToggle.checked,
+  ]);
+  return { key, files };
+}
+
+function _matchesLastServerResult(sig) {
+  const last = _lastServerResult;
+  return !!last && last.key === sig.key && last.files.length === sig.files.length
+    && last.files.every((f, i) => f === sig.files[i]);
+}
+
 // ── Live client-side preview ──────────────────────────────────────────────────
 const _bitmapCache = {};  // cell.id → ImageBitmap
 
@@ -2094,11 +2153,79 @@ function _renderZoomStrip({ cv, dw0, ov, cvW, cvH }) {
   zoomPanel.style.display = 'block';
 }
 
-async function _getBitmap(cell) {
+// The live composite is capped at LIVE_MAX_PX on its longest side, so no
+// single image is ever drawn larger than that. Caching a bitmap pre-shrunk
+// to that bound (plus the natural size, which the layout math needs) means
+// each rAF tick resamples a few megapixels instead of full camera frames.
+const LIVE_MAX_PX = 2000;
+
+async function _loadPreviewBitmap(file) {
+  const full = await createImageBitmap(file, { imageOrientation: 'from-image' });
+  const w = full.width, h = full.height;
+  const s = LIVE_MAX_PX / Math.max(w, h);
+  if (s >= 1) return { bmp: full, w, h };
+  // Downscale through a canvas: GPU-backed and far cheaper than
+  // createImageBitmap's resizeQuality option, which resamples on the CPU.
+  try {
+    const cv = Object.assign(document.createElement('canvas'), {
+      width: Math.max(1, Math.round(w * s)), height: Math.max(1, Math.round(h * s)),
+    });
+    const c = cv.getContext('2d');
+    c.imageSmoothingQuality = 'high';
+    c.drawImage(full, 0, 0, cv.width, cv.height);
+    return { bmp: await createImageBitmap(cv), w, h };
+  } finally { full.close(); }
+}
+
+function _getBitmap(cell) {
+  // Cache the promise so concurrent callers share one decode.
   if (!_bitmapCache[cell.id]) {
-    _bitmapCache[cell.id] = await createImageBitmap(cell.file, { imageOrientation: 'from-image' });
+    const p = _loadPreviewBitmap(cell.file);
+    _bitmapCache[cell.id] = p;
+    p.catch(() => { if (_bitmapCache[cell.id] === p) delete _bitmapCache[cell.id]; });
   }
   return _bitmapCache[cell.id];
+}
+
+function _evictBitmap(id) {
+  const p = _bitmapCache[id];
+  if (!p) return;
+  delete _bitmapCache[id];
+  p.then(e => e.bmp.close(), () => {});
+}
+
+// Reused across frames instead of allocating fresh canvases every tick.
+// The live composite is drawn straight into the on-screen canvas, so slider
+// feedback lands on the next frame with no JPEG encode/decode round trip.
+const _liveCanvas = previewLive;
+const _fadeCanvas = document.createElement('canvas');
+
+// Draws one image whose leading `ov` px (along `horizontal` or vertical)
+// cross-fade over what is already on ctx. Only the overlap band goes
+// through the scratch canvas; the rest is a plain drawImage.
+function _drawFaded(ctx, e, x, y, dw, dh, ov, horizontal) {
+  const bmp = e.bmp;
+  const fx = bmp.width / dw, fy = bmp.height / dh;   // dest px → bitmap px
+  const bw = horizontal ? ov : dw, bh = horizontal ? dh : ov;
+  if (_fadeCanvas.width !== bw || _fadeCanvas.height !== bh) {
+    _fadeCanvas.width = bw; _fadeCanvas.height = bh;
+  }
+  const tc = _fadeCanvas.getContext('2d');
+  tc.globalCompositeOperation = 'source-over';
+  tc.clearRect(0, 0, bw, bh);
+  tc.drawImage(bmp, 0, 0, bw * fx, bh * fy, 0, 0, bw, bh);
+  const grad = horizontal ? tc.createLinearGradient(0, 0, ov, 0) : tc.createLinearGradient(0, 0, 0, ov);
+  grad.addColorStop(0, 'rgba(0,0,0,0)');
+  grad.addColorStop(1, 'rgba(0,0,0,1)');
+  tc.globalCompositeOperation = 'destination-in';
+  tc.fillStyle = grad;
+  tc.fillRect(0, 0, bw, bh);
+  ctx.drawImage(_fadeCanvas, x, y);
+  if (horizontal && dw > ov) {
+    ctx.drawImage(bmp, ov * fx, 0, bmp.width - ov * fx, bmp.height, x + ov, y, dw - ov, dh);
+  } else if (!horizontal && dh > ov) {
+    ctx.drawImage(bmp, 0, ov * fy, bmp.width, bmp.height - ov * fy, x, y + ov, dw, dh - ov);
+  }
 }
 
 async function updateLivePreview() {
@@ -2113,142 +2240,75 @@ async function updateLivePreview() {
     : grid.map(r => r[0]).filter(Boolean);
   if (cells.length < 2) return;
 
-  let bitmaps;
-  try { bitmaps = await Promise.all(cells.map(_getBitmap)); }
+  const gen = _previewGen;
+  let entries;
+  try { entries = await Promise.all(cells.map(_getBitmap)); }
   catch (_) { return; }
+  // A server result (or another layout) replaced the preview while we were
+  // waiting on bitmaps — don't paint a stale low-res composite over it.
+  if (gen !== _previewGen) return;
 
   const overlap = Math.max(0, parseInt(overlapSlider.value) || 0);
   const isFade  = overlapFadeToggle.checked;
 
-  // Natural canvas size
+  // Natural canvas size (from full-resolution dimensions)
   let natW, natH;
   if (direction === 'horizontal') {
-    natW = bitmaps.reduce((s, b) => s + b.width,  0) - overlap * (bitmaps.length - 1);
-    natH = Math.max(...bitmaps.map(b => b.height));
+    natW = entries.reduce((s, e) => s + e.w, 0) - overlap * (entries.length - 1);
+    natH = Math.max(...entries.map(e => e.h));
   } else {
-    natW = Math.max(...bitmaps.map(b => b.width));
-    natH = bitmaps.reduce((s, b) => s + b.height, 0) - overlap * (bitmaps.length - 1);
+    natW = Math.max(...entries.map(e => e.w));
+    natH = entries.reduce((s, e) => s + e.h, 0) - overlap * (entries.length - 1);
   }
   if (natW <= 0 || natH <= 0) return;
 
-  // Scale down to ≤2000px on longest side for speed
-  const scale = Math.min(1, 2000 / Math.max(natW, natH));
+  // Scale down to ≤LIVE_MAX_PX on longest side for speed
+  const scale = Math.min(1, LIVE_MAX_PX / Math.max(natW, natH));
   const cvW = Math.max(1, Math.round(natW * scale));
   const cvH = Math.max(1, Math.round(natH * scale));
   const ov  = Math.round(overlap * scale);
 
-  const cv  = document.createElement('canvas');
-  cv.width  = cvW;
-  cv.height = cvH;
+  const cv  = _liveCanvas;
+  if (cv.width !== cvW || cv.height !== cvH) { cv.width = cvW; cv.height = cvH; }
   const ctx = cv.getContext('2d');
+  ctx.clearRect(0, 0, cvW, cvH);
 
-  if (direction === 'horizontal') {
-    let x = 0;
-    for (let i = 0; i < bitmaps.length; i++) {
-      const bmp = bitmaps[i];
-      const dw  = Math.round(bmp.width  * scale);
-      const dh  = Math.round(bmp.height * scale);
-      if (i > 0) x -= ov;
-      if (isFade && i > 0 && ov > 0) {
-        // Fade: draw the incoming image with a left-to-right alpha ramp
-        const tmp = document.createElement('canvas');
-        tmp.width = dw; tmp.height = dh;
-        const tc  = tmp.getContext('2d');
-        tc.drawImage(bmp, 0, 0, dw, dh);
-        const grad = tc.createLinearGradient(0, 0, ov, 0);
-        grad.addColorStop(0, 'rgba(0,0,0,0)');
-        grad.addColorStop(1, 'rgba(0,0,0,1)');
-        tc.globalCompositeOperation = 'destination-in';
-        tc.fillStyle = grad;
-        tc.fillRect(0, 0, ov, dh);
-        ctx.drawImage(tmp, x, 0);
-      } else {
-        ctx.drawImage(bmp, x, 0, dw, dh);
-      }
-      x += dw;
-    }
-  } else {
-    let y = 0;
-    for (let i = 0; i < bitmaps.length; i++) {
-      const bmp = bitmaps[i];
-      const dw  = Math.round(bmp.width  * scale);
-      const dh  = Math.round(bmp.height * scale);
-      if (i > 0) y -= ov;
-      if (isFade && i > 0 && ov > 0) {
-        const tmp = document.createElement('canvas');
-        tmp.width = dw; tmp.height = dh;
-        const tc  = tmp.getContext('2d');
-        tc.drawImage(bmp, 0, 0, dw, dh);
-        const grad = tc.createLinearGradient(0, 0, 0, ov);
-        grad.addColorStop(0, 'rgba(0,0,0,0)');
-        grad.addColorStop(1, 'rgba(0,0,0,1)');
-        tc.globalCompositeOperation = 'destination-in';
-        tc.fillStyle = grad;
-        tc.fillRect(0, 0, dw, ov);
-        ctx.drawImage(tmp, 0, y);
-      } else {
-        ctx.drawImage(bmp, 0, y, dw, dh);
-      }
-      y += dh;
-    }
+  const horizontal = direction === 'horizontal';
+  let pos = 0;
+  for (let i = 0; i < entries.length; i++) {
+    const e  = entries[i];
+    const dw = Math.round(e.w * scale);
+    const dh = Math.round(e.h * scale);
+    if (i > 0) pos -= ov;
+    const x = horizontal ? pos : 0, y = horizontal ? 0 : pos;
+    if (isFade && i > 0 && ov > 0) _drawFaded(ctx, e, x, y, dw, dh, ov, horizontal);
+    else ctx.drawImage(e.bmp, x, y, dw, dh);
+    pos += horizontal ? dw : dh;
   }
 
   // Zoom view of seam edge (horizontal layouts only)
   if (_zoomActive && direction === 'horizontal' && ov > 0) {
-    const dw0 = Math.round(bitmaps[0].width * scale);
+    const dw0 = Math.round(entries[0].w * scale);
     _lastZoomParams = { cv, dw0, ov, cvW, cvH };
     _renderZoomStrip(_lastZoomParams);
   } else if (!_zoomActive) {
     zoomPanel.style.display = 'none';
   }
 
-  _scheduleCanvasPublish(cv, cvW, cvH, cells.length, overlap);
+  _showPreview(previewLive, cvW >= cvH);
+  statusEl.textContent = `${cells.length} images · ${overlap}px overlap`;
 }
 
-// Publishing the composited canvas to <img> requires a JPEG encode
-// (cv.toBlob) followed by a browser JPEG decode (previewImg.src load).
-// That's cheap once, but updateLivePreview's caller (scheduleLivePreview)
-// re-runs on every rAF tick while a slider is being dragged, so publishing
-// is throttled to a fixed interval with a trailing-edge flush — the
-// composite itself (and the zoom-strip redraw) still happens every frame.
-const PREVIEW_PUBLISH_INTERVAL_MS = 80;
-let _lastPreviewPublishTime = 0;
-let _previewPublishTimer = null;
-let _pendingPreviewPublish = null;
+// Bumped whenever the preview pane gets authoritative content (a server
+// result), invalidating any live composite still in flight.
+let _previewGen = 0;
 
-function _publishPreviewCanvas({ cv, cvW, cvH, cellCount, overlap }) {
-  cv.toBlob(blob => {
-    if (!blob) return;
-    if (_previewObjectURL) URL.revokeObjectURL(_previewObjectURL);
-    _previewObjectURL = URL.createObjectURL(blob);
-    previewImg.onload = () => {
-      const landscape = cvW >= cvH;
-      appBody.classList.toggle('layout-side',  !landscape);
-      appBody.classList.toggle('layout-stack',  landscape);
-      appBody.classList.add('has-preview');
-    };
-    previewImg.src = _previewObjectURL;
-    statusEl.textContent = `${cellCount} images · ${overlap}px overlap`;
-  }, 'image/jpeg', 0.92);
-}
-
-function _scheduleCanvasPublish(cv, cvW, cvH, cellCount, overlap) {
-  _pendingPreviewPublish = { cv, cvW, cvH, cellCount, overlap };
-  const elapsed = performance.now() - _lastPreviewPublishTime;
-  if (elapsed >= PREVIEW_PUBLISH_INTERVAL_MS) {
-    _lastPreviewPublishTime = performance.now();
-    const data = _pendingPreviewPublish;
-    _pendingPreviewPublish = null;
-    _publishPreviewCanvas(data);
-  } else if (!_previewPublishTimer) {
-    _previewPublishTimer = setTimeout(() => {
-      _previewPublishTimer = null;
-      _lastPreviewPublishTime = performance.now();
-      const data = _pendingPreviewPublish;
-      _pendingPreviewPublish = null;
-      if (data) _publishPreviewCanvas(data);
-    }, PREVIEW_PUBLISH_INTERVAL_MS - elapsed);
-  }
+function _showPreview(el, landscape) {
+  previewLive.style.display = el === previewLive ? '' : 'none';
+  previewImg.style.display  = el === previewImg  ? '' : 'none';
+  appBody.classList.toggle('layout-side',  !landscape);
+  appBody.classList.toggle('layout-stack',  landscape);
+  appBody.classList.add('has-preview');
 }
 
 let _livePreviewPending = false;
@@ -2273,6 +2333,7 @@ stitchBtn.addEventListener('click', async () => {
   stitchBtn.textContent = 'Stitching…';
   stitchBtn.disabled = true;
   try {
+    const sig = _requestSignature();
     const res = await fetch('/preview', { method: 'POST', body: _buildFormData() });
     if (!res.ok) {
       const msg = await res.text().catch(() => res.statusText);
@@ -2280,18 +2341,12 @@ stitchBtn.addEventListener('click', async () => {
     }
     _syncOverlapFromResponse(res);
     const blob = await res.blob();
-    // A deferred client-side publish (from _scheduleCanvasPublish's trailing
-    // edge) could otherwise land after this and overwrite the server result
-    // with the lower-res client composite.
-    if (_previewPublishTimer) { clearTimeout(_previewPublishTimer); _previewPublishTimer = null; }
-    _pendingPreviewPublish = null;
+    _lastServerResult = { ...sig, blob };
+    _previewGen++;
     if (_previewObjectURL) URL.revokeObjectURL(_previewObjectURL);
     _previewObjectURL = URL.createObjectURL(blob);
     previewImg.onload = () => {
-      const landscape = previewImg.naturalWidth >= previewImg.naturalHeight;
-      appBody.classList.toggle('layout-side', !landscape);
-      appBody.classList.toggle('layout-stack', landscape);
-      appBody.classList.add('has-preview');
+      _showPreview(previewImg, previewImg.naturalWidth >= previewImg.naturalHeight);
     };
     previewImg.src = _previewObjectURL;
     const kb = Math.round(blob.size / 1024);
@@ -2334,10 +2389,17 @@ downloadBtn.addEventListener('click', async e => {
   downloadBtn.textContent = 'Downloading…';
   downloadBtn.style.pointerEvents = 'none';
   try {
-    const res = await fetch('/stitch', { method: 'POST', body: _buildFormData() });
-    if (!res.ok) throw new Error(res.statusText);
-    _syncOverlapFromResponse(res);
-    const blob = await res.blob();
+    const sig = _requestSignature();
+    let blob;
+    if (_matchesLastServerResult(sig)) {
+      blob = _lastServerResult.blob;
+    } else {
+      const res = await fetch('/stitch', { method: 'POST', body: _buildFormData() });
+      if (!res.ok) throw new Error(res.statusText);
+      _syncOverlapFromResponse(res);
+      blob = await res.blob();
+      _lastServerResult = { ...sig, blob };
+    }
     const url  = URL.createObjectURL(blob);
     Object.assign(document.createElement('a'), { href: url, download: 'stitched.jpg' }).click();
     setTimeout(() => URL.revokeObjectURL(url), 2000);
