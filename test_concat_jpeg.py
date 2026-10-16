@@ -723,3 +723,86 @@ class TestFormatToExt:
         assert cj._FORMAT_TO_EXT["ICO"] == ".ico"
         assert cj._FORMAT_TO_EXT["PDF"] == ".pdf"
 
+
+
+# ── Tests: web UI routes ──────────────────────────────────────────────────────
+
+@pytest.mark.skipif(not cj._HAS_FLASK, reason="Flask not installed")
+class TestWebApp:
+    def _client(self, on_quit=None):
+        return cj._create_web_app(on_quit=on_quit).test_client()
+
+    def _jpeg_bytes(self, size, color):
+        import io
+        buf = io.BytesIO()
+        Image.new("RGB", size, color).save(buf, "JPEG", quality=90)
+        buf.seek(0)
+        return buf
+
+    def test_index_has_quit_button(self):
+        res = self._client().get("/")
+        assert res.status_code == 200
+        assert b'id="quit-btn"' in res.data
+
+    def test_quit_invokes_callback(self):
+        calls = []
+        res = self._client(on_quit=lambda: calls.append(1)).post(
+            "/quit", headers={"X-Requested-With": "fetch"})
+        assert res.status_code == 204
+        assert calls == [1]
+
+    def test_quit_rejects_get(self):
+        calls = []
+        res = self._client(on_quit=lambda: calls.append(1)).get("/quit")
+        assert res.status_code == 405
+        assert calls == []
+
+    def test_quit_rejects_plain_post_without_header(self):
+        """A cross-site <form> POST can't set custom headers, so it must be refused."""
+        calls = []
+        res = self._client(on_quit=lambda: calls.append(1)).post("/quit")
+        assert res.status_code == 403
+        assert calls == []
+
+    def test_quit_rejects_foreign_origin(self):
+        calls = []
+        res = self._client(on_quit=lambda: calls.append(1)).post(
+            "/quit", headers={"X-Requested-With": "fetch", "Origin": "https://evil.example"})
+        assert res.status_code == 403
+        assert calls == []
+
+    def test_quit_accepts_same_origin(self):
+        calls = []
+        res = self._client(on_quit=lambda: calls.append(1)).post(
+            "/quit", headers={"X-Requested-With": "fetch", "Origin": "http://localhost"})
+        assert res.status_code == 204
+        assert calls == [1]
+
+    def test_preview_stitches_uploaded_images(self):
+        import io, json
+        data = {
+            "layout": json.dumps([["a", "b"]]),
+            "fit": "false", "overlap": "10", "overlap_blend": "fade",
+            "a": (self._jpeg_bytes((60, 40), (255, 0, 0)), "a.jpg"),
+            "b": (self._jpeg_bytes((60, 40), (0, 0, 255)), "b.jpg"),
+        }
+        res = self._client().post("/preview", data=data, content_type="multipart/form-data")
+        assert res.status_code == 200
+        assert res.headers["X-Overlap-Px"] == "10"
+        out = Image.open(io.BytesIO(res.data))
+        assert out.size == (110, 40)
+
+    def test_stitch_ignores_unreferenced_uploads_and_rejects_empty_layout(self):
+        import io, json
+        client = self._client()
+        data = {
+            "layout": json.dumps([["a"], ["b"]]),
+            "a": (self._jpeg_bytes((40, 30), (255, 0, 0)), "a.jpg"),
+            "b": (self._jpeg_bytes((40, 30), (0, 255, 0)), "b.jpg"),
+            "unused": (self._jpeg_bytes((10, 10), (0, 0, 0)), "c.jpg"),
+        }
+        res = client.post("/stitch", data=data, content_type="multipart/form-data")
+        assert res.status_code == 200
+        assert Image.open(io.BytesIO(res.data)).size == (40, 60)
+        res = client.post("/stitch", data={"layout": "[]"}, content_type="multipart/form-data")
+        assert res.status_code == 400

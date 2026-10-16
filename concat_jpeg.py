@@ -1309,6 +1309,45 @@ h1 {
   height: 22px;
 }
 
+#quit-btn {
+  padding: 6px 14px;
+  background: transparent;
+  color: #1d1d1f;
+  border: 1px solid #c0c0c0;
+  border-radius: 9999px;
+  font-family: inherit;
+  font-size: 14px;
+  letter-spacing: -0.224px;
+  line-height: 1;
+  cursor: pointer;
+  transition: border-color 0.12s, color 0.12s, background 0.12s;
+  white-space: nowrap;
+}
+#quit-btn:hover:not(:disabled) { border-color: #dc2626; color: #dc2626; }
+#quit-btn:disabled { color: #999; cursor: default; }
+#quit-btn:focus-visible {
+  outline: 2px solid #0071e3;
+  outline-offset: 2px;
+}
+
+#stopped {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: #f5f5f7;
+  z-index: 200;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 8px;
+  color: #1d1d1f;
+  text-align: center;
+  padding: 24px;
+}
+#stopped.visible { display: flex; }
+#stopped strong { font-size: 21px; font-weight: 600; letter-spacing: -0.4px; }
+#stopped span { font-size: 15px; color: #7a7a7a; }
+
 #processing {
   display: none;
   position: fixed;
@@ -1372,6 +1411,7 @@ h1 {
       </label>
     </div>
     <button id="stitch-btn" disabled>Stitch &amp; Preview</button>
+    <button id="quit-btn" title="Stop the Image Stitcher server">Quit</button>
   </div>
 </header>
 
@@ -1414,6 +1454,11 @@ h1 {
     </div>
     <a id="download-btn" download="stitched.jpg">Download</a>
   </div>
+</div>
+
+<div id="stopped" role="status" aria-live="polite">
+  <strong>Image Stitcher has stopped</strong>
+  <span>You can close this tab. Run <code>jpegconcat --web</code> to start it again.</span>
 </div>
 
 <div id="processing">
@@ -2232,6 +2277,27 @@ stitchBtn.addEventListener('click', async () => {
   }
 });
 
+const quitBtn   = document.getElementById('quit-btn');
+const stoppedEl = document.getElementById('stopped');
+quitBtn.addEventListener('click', async () => {
+  quitBtn.disabled = true;
+  quitBtn.textContent = 'Quitting…';
+  try {
+    const res = await fetch('/quit', { method: 'POST', headers: { 'X-Requested-With': 'fetch' } });
+    if (!res.ok) throw Object.assign(new Error(`Server error ${res.status}`), { fromServer: true });
+  } catch (err) {
+    // A network error just means the server went away mid-response — that's
+    // the goal. Only an actual HTTP error response means quitting failed.
+    if (err.fromServer) {
+      statusEl.textContent = 'Quit failed: ' + err.message;
+      quitBtn.disabled = false;
+      quitBtn.textContent = 'Quit';
+      return;
+    }
+  }
+  stoppedEl.classList.add('visible');
+});
+
 downloadBtn.addEventListener('click', async e => {
   e.preventDefault();
   if (!hasImages()) return;
@@ -2442,17 +2508,13 @@ def _stitch_grid(layout, paths, td, fit=False, overlap=0, overlap_blend="hard", 
     return output_buf, overlap
 
 
-def _run_web_server(port=5001):
-    """Launch the drag-and-drop web UI and open it in the default browser."""
-    if not _HAS_FLASK:
-        print(
-            "Flask is required for the web UI.\n"
-            "Install it with:  pip3 install flask --break-system-packages\n"
-            "Or install via Homebrew:  brew upgrade jpegconcat"
-        )
-        sys.exit(1)
+def _create_web_app(on_quit=None):
+    """Build the Flask app for the web UI.
 
-    import json as _json, threading, webbrowser
+    on_quit — called (with no args) when the UI's Quit button POSTs /quit;
+              the caller decides how to actually stop serving.
+    """
+    import json as _json
     from flask import Flask, abort, request, send_file
 
     app = Flask(__name__)
@@ -2562,21 +2624,69 @@ def _run_web_server(port=5001):
         resp.headers["X-Overlap-Blend"] = overlap_blend
         return resp
 
+    @app.route("/quit", methods=["POST"])
+    def quit_server():
+        # A custom header can't be sent cross-origin without a CORS preflight
+        # (which this app never approves), so other web pages can't use a
+        # plain form POST to stop the server. The Origin check backs that up.
+        if request.headers.get("X-Requested-With") != "fetch":
+            abort(403)
+        origin = request.headers.get("Origin")
+        if origin and origin.rstrip("/") != request.host_url.rstrip("/"):
+            abort(403)
+        if on_quit:
+            on_quit()
+        return "", 204
+
+    return app
+
+
+def _run_web_server(port=5001):
+    """Launch the drag-and-drop web UI and open it in the default browser."""
+    if not _HAS_FLASK:
+        print(
+            "Flask is required for the web UI.\n"
+            "Install it with:  pip3 install flask --break-system-packages\n"
+            "Or install via Homebrew:  brew upgrade jpegconcat"
+        )
+        sys.exit(1)
+
+    import threading, time, webbrowser
+    from werkzeug.serving import make_server
+
+    server = None
+
+    def _shutdown_soon():
+        # Let the /quit response flush before the serve loop stops.
+        time.sleep(0.2)
+        server.shutdown()
+
+    app = _create_web_app(
+        on_quit=lambda: threading.Thread(target=_shutdown_soon, daemon=True).start()
+    )
+
+    try:
+        server = make_server("127.0.0.1", port, app, threaded=True)
+    except SystemExit:
+        # werkzeug prints its own "Address already in use" and exits; add our hint.
+        print(f"Try: jpegconcat --web --port {port + 1}")
+        sys.exit(1)
+
     url = f"http://localhost:{port}"
-    print(f"Image Stitcher → {url}  (Ctrl-C to quit)")
+    print(f"Image Stitcher → {url}  (Quit button or Ctrl-C to stop)")
 
     def _open():
-        import time; time.sleep(0.6)
+        time.sleep(0.6)
         webbrowser.open(url)
     threading.Thread(target=_open, daemon=True).start()
 
     try:
-        app.run(debug=False, port=port, threaded=True)
-    except OSError as exc:
-        if "Address already in use" in str(exc):
-            print(f"Port {port} is in use. Try: jpegconcat --web --port {port + 1}")
-            sys.exit(1)
-        raise
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    print("Image Stitcher stopped.")
 
 
 def main():
