@@ -836,3 +836,26 @@ class TestWebApp:
         assert Image.open(io.BytesIO(res.data)).size == (40, 60)
         res = client.post("/stitch", data={"layout": "[]"}, content_type="multipart/form-data")
         assert res.status_code == 400
+
+
+class TestWebUIScript:
+    """Static checks on the embedded web UI, which has no JS test suite."""
+
+    def _script(self):
+        import re
+        return re.search(r"<script>(.*)</script>", cj._WEB_UI_HTML, re.S).group(1)
+
+    @pytest.mark.skipif(not __import__("shutil").which("node"), reason="node not installed")
+    def test_script_is_valid_javascript(self, tmp_path):
+        import subprocess
+        js = tmp_path / "ui.js"
+        js.write_text(self._script())
+        res = subprocess.run(["node", "--check", str(js)], capture_output=True, text=True)
+        assert res.returncode == 0, res.stderr
+
+    def test_every_looked_up_id_exists(self):
+        import re
+        ids = set(re.findall(r'id="([^"]+)"', cj._WEB_UI_HTML))
+        used = set(re.findall(r"getElementById\('([^']+)'\)", self._script()))
+        assert used, "expected getElementById lookups in the script"
+        assert used <= ids, f"script looks up missing ids: {sorted(used - ids)}"

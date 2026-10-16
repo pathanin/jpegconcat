@@ -1529,7 +1529,7 @@ body.loading, body.loading * { cursor: progress !important; }
       <span>Overlap</span>
       <input type="range" id="overlap-slider" min="0" max="800" value="0" step="1">
       <button id="overlap-dec-btn" class="overlap-step-btn" title="Decrease by 1px">−</button>
-      <span id="overlap-val">0 px</span>
+      <span id="overlap-val">Auto</span>
       <button id="overlap-inc-btn" class="overlap-step-btn" title="Increase by 1px">+</button>
       <button id="zoom-toggle-btn" class="overlap-step-btn" title="Zoom into the seam edge" style="width:auto;padding:0 7px;font-size:12px">Zoom</button>
       <button id="overlap-auto-btn" class="active" title="Re-detect best overlap">Auto</button>
@@ -1875,6 +1875,7 @@ function moveCellToZone(srcR, srcC, dstR, dstC, zone) {
 }
 
 async function applyTransform(r, c, type) {
+  _finalizeUndo();  // undo snapshots hold cell objects this would replace
   const cell = grid[r][c];
   if (!cell) return;
   const img = await createImageBitmap(cell.file, { imageOrientation: 'from-image' });
@@ -1933,6 +1934,7 @@ function updateCellInPlace(r, c) {
 // runs. Unreadable files are skipped and reported rather than failing the
 // whole batch.
 async function makeCells(files) {
+  _finalizeUndo();  // undo would silently drop the images being added
   _statusError = null;
   const all = [...files];
   const imgs = all.filter(f => f.type.startsWith('image/'));
@@ -2104,7 +2106,11 @@ function onLayoutChanged() {
   }
   if (_liveSupported()) scheduleLivePreview();
   else if (appBody.classList.contains('has-preview')) {
-    if (_matchesLastServerResult(_requestSignature())) return;
+    // Back to the layout that was last stitched: the shown result is current.
+    if (_matchesLastServerResult(_requestSignature())) {
+      _setPreviewState('final', _lastServerResult.caption || ' ');
+      return;
+    }
     _previewGen++;
     _setPreviewState('stale');
   }
@@ -2200,6 +2206,7 @@ function buildCell(cell, r, c) {
     if (!dragSrc) return;
     const { r: sr, c: sc } = dragSrc;
     if (sr !== r || sc !== c) {
+      _finalizeUndo();
       const sameShape = moveCellToZone(sr, sc, r, c, zoneAt(e.clientX, e.clientY, el));
       if (sameShape) { updateCellInPlace(sr, sc); updateCellInPlace(r, c); onLayoutChanged(); }
       else render();
@@ -2343,10 +2350,10 @@ fileInput.addEventListener('change', e => {
   fileInput.value = '';
 });
 
-addLeftBtn.addEventListener('click', () => { if (hasImages()) { insertCol(-1); render(); } });
-addRightBtn.addEventListener('click', () => { if (hasImages()) { insertCol(nCols() - 1); render(); } });
-addTopBtn.addEventListener('click', () => { if (hasImages()) { insertRow(-1); render(); } });
-addBottomBtn.addEventListener('click', () => { if (hasImages()) { insertRow(nRows() - 1); render(); } });
+addLeftBtn.addEventListener('click', () => { if (hasImages()) { _finalizeUndo(); insertCol(-1); render(); } });
+addRightBtn.addEventListener('click', () => { if (hasImages()) { _finalizeUndo(); insertCol(nCols() - 1); render(); } });
+addTopBtn.addEventListener('click', () => { if (hasImages()) { _finalizeUndo(); insertRow(-1); render(); } });
+addBottomBtn.addEventListener('click', () => { if (hasImages()) { _finalizeUndo(); insertRow(nRows() - 1); render(); } });
 
 function _buildFormData() {
   const formData = new FormData();
