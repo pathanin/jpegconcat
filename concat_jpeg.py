@@ -914,17 +914,26 @@ h1 {
   transform: translateX(16px);
 }
 
+#stitch-btn, .ghost-btn, #quit-btn, #download-btn {
+  height: 36px;
+  padding: 0 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  font-size: 14px;
+  letter-spacing: -0.224px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
 #stitch-btn {
-  padding: 11px 22px;
   background: #0066cc;
   color: #fff;
   border: none;
   border-radius: 9999px;
   font-family: inherit;
-  font-size: 17px;
   font-weight: 400;
-  letter-spacing: -0.374px;
-  line-height: 1;
   cursor: pointer;
   transition: opacity 0.12s, transform 0.08s;
   white-space: nowrap;
@@ -934,7 +943,7 @@ h1 {
 #stitch-btn:active:not(:disabled) { transform: scale(0.95); }
 #stitch-btn:disabled {
   background: #e0e0e0;
-  color: #999;
+  color: #7a7a7a;
   cursor: default;
 }
 #stitch-btn:focus-visible {
@@ -997,7 +1006,7 @@ h1 {
   width: 100%;
   height: 100%;
   object-fit: contain;
-  border-radius: 6px;
+  border-radius: 8px;
   background: #ffffff;
 }
 
@@ -1026,15 +1035,11 @@ h1 {
 body.loading, body.loading * { cursor: progress !important; }
 
 .ghost-btn {
-  padding: 6px 14px;
   background: transparent;
   color: #0066cc;
   border: 1px solid #0066cc;
   border-radius: 9999px;
   font-family: inherit;
-  font-size: 14px;
-  letter-spacing: -0.224px;
-  line-height: 1;
   cursor: pointer;
   white-space: nowrap;
   transition: background 0.12s, transform 0.08s;
@@ -1044,21 +1049,15 @@ body.loading, body.loading * { cursor: progress !important; }
 .ghost-btn:focus-visible { outline: 2px solid #0071e3; outline-offset: 2px; }
 
 #download-btn {
-  display: inline-block;
-  padding: 11px 22px;
   background: transparent;
   color: #0066cc;
   border: 1px solid #0066cc;
   border-radius: 9999px;
   font-family: inherit;
-  font-size: 17px;
   font-weight: 400;
-  letter-spacing: -0.374px;
-  line-height: 1;
   cursor: pointer;
   text-decoration: none;
   transition: background 0.12s, transform 0.08s;
-  flex-shrink: 0;
   white-space: nowrap;
 }
 
@@ -1365,8 +1364,8 @@ body.loading, body.loading * { cursor: progress !important; }
   outline: 2px solid #0071e3; outline-offset: 2px;
 }
 .zoom-level-btn {
-  padding: 1px 5px;
-  font-size: 11px;
+  font-family: inherit;
+  transition: border-color 0.12s, color 0.12s, transform 0.08s;
   border: 1px solid #e0e0e0;
   border-radius: 8px;
   background: transparent;
@@ -1375,9 +1374,19 @@ body.loading, body.loading * { cursor: progress !important; }
 }
 .zoom-level-btn.active { background: #0066cc; color: #fff; border-color: #0066cc; }
 
-#overlap-auto-btn {
-  padding: 3px 8px;
+#overlap-auto-btn, .zoom-level-btn, .overlap-step-btn.text-btn {
+  width: auto;
+  height: 22px;
+  padding: 0 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   font-size: 12px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+#overlap-auto-btn:active, .zoom-level-btn:active { transform: scale(0.95); }
+#overlap-auto-btn {
   font-family: inherit;
   font-weight: 400;
   background: transparent;
@@ -1385,8 +1394,7 @@ body.loading, body.loading * { cursor: progress !important; }
   border-radius: 8px;
   color: #1d1d1f;
   cursor: pointer;
-  transition: border-color 0.12s, color 0.12s;
-  line-height: 1;
+  transition: border-color 0.12s, color 0.12s, transform 0.08s;
 }
 #overlap-auto-btn:hover { border-color: #0066cc; color: #0066cc; }
 #overlap-auto-btn.active { border-color: #0066cc; color: #0066cc; background: rgba(0,102,204,0.06); }
@@ -1402,13 +1410,15 @@ body.loading, body.loading * { cursor: progress !important; }
 .add-btn {
   background: transparent;
   border: 1px dashed #e0e0e0;
-  border-radius: 6px;
+  border-radius: 8px;
   color: #7a7a7a;
   font-size: 1rem;
   cursor: pointer;
-  transition: background 0.12s, color 0.12s, border-color 0.12s;
+  transition: background 0.12s, color 0.12s, border-color 0.12s, transform 0.08s;
   flex-shrink: 0;
 }
+.add-btn:active { transform: scale(0.95); }
+.add-btn:focus-visible { outline: 2px solid #0071e3; outline-offset: 2px; }
 
 .add-btn:hover {
   background: #0066cc;
@@ -1435,22 +1445,19 @@ body.loading, body.loading * { cursor: progress !important; }
 }
 
 #quit-btn {
-  padding: 6px 14px;
   background: transparent;
   color: #1d1d1f;
   border: 1px solid #e0e0e0;
   border-radius: 9999px;
   font-family: inherit;
-  font-size: 14px;
-  letter-spacing: -0.224px;
-  line-height: 1;
   cursor: pointer;
-  transition: border-color 0.12s, color 0.12s, background 0.12s;
+  transition: border-color 0.12s, color 0.12s, background 0.12s, transform 0.08s;
   white-space: nowrap;
 }
 #quit-btn:hover:not(:disabled) { border-color: #1d1d1f; }
 #quit-btn.armed { background: #1d1d1f; border-color: #1d1d1f; color: #fff; }
-#quit-btn:disabled { color: #999; cursor: default; }
+#quit-btn:active:not(:disabled) { transform: scale(0.95); }
+#quit-btn:disabled { color: #7a7a7a; cursor: default; }
 #quit-btn:focus-visible {
   outline: 2px solid #0071e3;
   outline-offset: 2px;
@@ -1531,7 +1538,7 @@ body.loading, body.loading * { cursor: progress !important; }
       <button id="overlap-dec-btn" class="overlap-step-btn" title="Decrease by 1px">−</button>
       <span id="overlap-val">Auto</span>
       <button id="overlap-inc-btn" class="overlap-step-btn" title="Increase by 1px">+</button>
-      <button id="zoom-toggle-btn" class="overlap-step-btn" title="Zoom into the seam edge" style="width:auto;padding:0 7px;font-size:12px">Zoom</button>
+      <button id="zoom-toggle-btn" class="overlap-step-btn text-btn" title="Zoom into the seam edge">Zoom</button>
       <button id="overlap-auto-btn" class="active" title="Re-detect best overlap">Auto</button>
       <label class="fit-toggle-label" title="Cross-fade blend instead of hard paste">
         <input type="checkbox" id="overlap-fade-toggle" class="fit-toggle-input">
