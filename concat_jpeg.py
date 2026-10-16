@@ -1000,6 +1000,27 @@ h1 {
 #preview-pane[data-state="stale"] #preview-img,
 #preview-pane[data-state="stale"] #preview-live { opacity: 0.35; transition: opacity 0.15s; }
 
+#status.error { color: #1d1d1f; font-weight: 600; }
+body.loading, body.loading * { cursor: progress !important; }
+
+.ghost-btn {
+  padding: 6px 14px;
+  background: transparent;
+  color: #0066cc;
+  border: 1px solid #0066cc;
+  border-radius: 9999px;
+  font-family: inherit;
+  font-size: 14px;
+  letter-spacing: -0.224px;
+  line-height: 1;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.12s, transform 0.08s;
+}
+.ghost-btn:hover { background: rgba(0,102,204,0.06); }
+.ghost-btn:active { transform: scale(0.95); }
+.ghost-btn:focus-visible { outline: 2px solid #0071e3; outline-offset: 2px; }
+
 #download-btn {
   display: inline-block;
   padding: 11px 22px;
@@ -1460,6 +1481,7 @@ h1 {
         <span>Fade</span>
       </label>
     </div>
+    <button id="add-images-btn" class="ghost-btn" style="display:none" title="Add more images to the end">Add Images</button>
     <button id="stitch-btn" disabled>Stitch &amp; Preview</button>
     <button id="quit-btn" title="Stop the Image Stitcher server">Quit</button>
   </div>
@@ -1541,6 +1563,7 @@ const addRightBtn   = document.getElementById('add-right-btn');
 const addTopBtn     = document.getElementById('add-top-btn');
 const addBottomBtn  = document.getElementById('add-bottom-btn');
 const stitchBtn     = document.getElementById('stitch-btn');
+const addImagesBtn  = document.getElementById('add-images-btn');
 const statusEl      = document.getElementById('status');
 const processingEl  = document.getElementById('processing');
 const previewImg    = document.getElementById('preview-img');
@@ -1811,26 +1834,61 @@ function updateCellInPlace(r, c) {
 // thumbnail and the (pre-warmed) live-preview bitmap, so the first slider
 // drag never stalls on a decode. Costs some memory up front, in exchange
 // for smoothness.
+// Decodes the image files into cells, with a loading message while it
+// runs. Unreadable files are skipped and reported rather than failing the
+// whole batch.
 async function makeCells(files) {
-  const imgs = [...files].filter(f => f.type.startsWith('image/'));
-  return Promise.all(imgs.map(async f => {
-    const full = await createImageBitmap(f, { imageOrientation: 'from-image' });
-    const cell = { id: uid(), name: f.name, file: f };
-    let entry;
-    try {
-      // Both start their synchronous draws from `full` before it is closed.
-      const thumbP = _thumbFromSource(full, 400);
-      entry = _previewEntryFrom(full);
-      cell.dataURL = await thumbP;
-    } catch (err) {
-      full.close();
-      if (entry) entry.then(e => e.bmp.close(), () => {});
-      throw err;
-    }
-    _bitmapCache[cell.id] = entry;
-    entry.catch(() => { if (_bitmapCache[cell.id] === entry) delete _bitmapCache[cell.id]; });
-    return cell;
-  }));
+  _statusError = null;
+  const all = [...files];
+  const imgs = all.filter(f => f.type.startsWith('image/'));
+  if (!imgs.length) {
+    if (all.length) showError('Those files aren’t images. Use JPEG, PNG or WebP.');
+    return [];
+  }
+  statusEl.classList.remove('error');
+  statusEl.textContent = `Loading ${imgs.length} image${imgs.length !== 1 ? 's' : ''}…`;
+  document.body.classList.add('loading');
+  try {
+    const results = await Promise.allSettled(imgs.map(_makeCell));
+    const bad = imgs.filter((_, i) => results[i].status === 'rejected').map(f => f.name);
+    const skipped = all.length - imgs.length;
+    if (bad.length) showError(`Couldn’t read ${bad.join(', ')}`);
+    else if (skipped) showError(`Skipped ${skipped} file${skipped !== 1 ? 's' : ''} that aren’t images`);
+    else updateStatus();
+    return results.filter(r => r.status === 'fulfilled').map(r => r.value);
+  } finally {
+    document.body.classList.remove('loading');
+  }
+}
+
+async function _makeCell(f) {
+  const full = await createImageBitmap(f, { imageOrientation: 'from-image' });
+  const cell = { id: uid(), name: f.name, file: f };
+  let entry;
+  try {
+    // Both start their synchronous draws from `full` before it is closed.
+    const thumbP = _thumbFromSource(full, 400);
+    entry = _previewEntryFrom(full);
+    cell.dataURL = await thumbP;
+  } catch (err) {
+    full.close();
+    if (entry) entry.then(e => e.bmp.close(), () => {});
+    throw err;
+  }
+  _bitmapCache[cell.id] = entry;
+  entry.catch(() => { if (_bitmapCache[cell.id] === entry) delete _bitmapCache[cell.id]; });
+  return cell;
+}
+
+// Adds images after the existing ones: down a single column, otherwise
+// along the first row.
+async function appendFiles(files) {
+  if (!hasImages()) return initFromFiles(files);
+  const cells = await makeCells(files);
+  if (!cells.length) return;
+  if (nCols() === 1 && nRows() > 1) for (const c of cells) grid.push([c]);
+  else for (const c of cells) { insertCol(nCols() - 1); grid[0][nCols() - 1] = c; }
+  render();
 }
 
 async function initFromFiles(files) {
@@ -1862,6 +1920,7 @@ function render() {
     dropZoneEl.style.display = 'flex';
     stitchBtn.disabled = true;
     overlapCtrl.style.display = 'none';
+    addImagesBtn.style.display = 'none';
     onLayoutChanged();
     return;
   }
@@ -1879,6 +1938,7 @@ function render() {
   }
   const n = imgCount();
   stitchBtn.disabled = n < 2;
+  addImagesBtn.style.display = '';
   // Overlap only applies to single-row or single-column grids — _stitch_grid
   // silently zeroes it for any other shape, so don't show a control that
   // would have no effect.
@@ -1897,7 +1957,17 @@ function render() {
 
 // One status line, rebuilt from current state rather than overwritten by
 // whichever code path ran last.
+let _statusError = null;
+
+// Errors stay in the status line (in bold) until the next action starts.
+function showError(msg) {
+  _statusError = msg;
+  updateStatus();
+}
+
 function updateStatus() {
+  statusEl.classList.toggle('error', !!_statusError);
+  if (_statusError) { statusEl.textContent = _statusError; return; }
   if (!hasImages()) { statusEl.textContent = 'Drop images to start'; return; }
   const n = imgCount();
   let s = `${n} image${n !== 1 ? 's' : ''} · ${nRows()}×${nCols()} grid`;
@@ -2035,11 +2105,7 @@ function buildEmptyCell(r, c) {
   el.dataset.c = c;
   el.textContent = '+';
   el.addEventListener('dragover', e => { e.preventDefault(); });
-  el.addEventListener('click', () => {
-    fileInput.dataset.targetR = r;
-    fileInput.dataset.targetC = c;
-    fileInput.click();
-  });
+  el.addEventListener('click', () => openPicker(r, c));
   return el;
 }
 
@@ -2140,8 +2206,18 @@ document.addEventListener('dragend', () => {
   clearAllHighlights();
 });
 
-dropZoneEl.addEventListener('click', () => fileInput.click());
-dropZoneEl.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fileInput.click(); } });
+// Opens the file picker aimed at an empty cell, or (no target) at the end
+// of the grid. The target is always reset, so cancelling a cell's picker
+// can't redirect a later browse into that cell.
+function openPicker(r, c) {
+  if (r === undefined) { delete fileInput.dataset.targetR; delete fileInput.dataset.targetC; }
+  else { fileInput.dataset.targetR = r; fileInput.dataset.targetC = c; }
+  fileInput.click();
+}
+
+dropZoneEl.addEventListener('click', () => openPicker());
+dropZoneEl.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openPicker(); } });
+document.getElementById('add-images-btn').addEventListener('click', () => openPicker());
 fileInput.addEventListener('change', e => {
   if (!e.target.files.length) { fileInput.value = ''; return; }
   const tr = fileInput.dataset.targetR;
@@ -2151,7 +2227,7 @@ fileInput.addEventListener('change', e => {
     delete fileInput.dataset.targetR;
     delete fileInput.dataset.targetC;
   } else {
-    initFromFiles(e.target.files);
+    appendFiles(e.target.files);
   }
   fileInput.value = '';
 });
@@ -2455,6 +2531,7 @@ function _syncOverlapFromResponse(res) {
 
 stitchBtn.addEventListener('click', async () => {
   if (!hasImages()) return;
+  _statusError = null;
   processingEl.classList.add('visible');
   stitchBtn.textContent = 'Stitching…';
   stitchBtn.disabled = true;
@@ -2485,7 +2562,7 @@ stitchBtn.addEventListener('click', async () => {
     updateStatus();
   } catch (err) {
     console.error(err);
-    statusEl.textContent = 'Error: ' + err.message;
+    showError('Stitch failed: ' + err.message);
   } finally {
     processingEl.classList.remove('visible');
     stitchBtn.textContent = 'Stitch & Preview';
@@ -2505,7 +2582,7 @@ quitBtn.addEventListener('click', async () => {
     // A network error just means the server went away mid-response — that's
     // the goal. Only an actual HTTP error response means quitting failed.
     if (err.fromServer) {
-      statusEl.textContent = 'Quit failed: ' + err.message;
+      showError('Quit failed: ' + err.message);
       quitBtn.disabled = false;
       quitBtn.textContent = 'Quit';
       return;
@@ -2514,9 +2591,17 @@ quitBtn.addEventListener('click', async () => {
   stoppedEl.classList.add('visible');
 });
 
+// Names the download after the first image, e.g. beach.jpg → beach_stitched.jpg.
+function _downloadName() {
+  const first = grid.flat().find(Boolean);
+  const base = first ? first.name.replace(/\.[^.]*$/, '') : '';
+  return (base || 'stitched') + (base ? '_stitched' : '') + '.jpg';
+}
+
 downloadBtn.addEventListener('click', async e => {
   e.preventDefault();
   if (!hasImages()) return;
+  _statusError = null;
   const prev = downloadBtn.textContent;
   downloadBtn.textContent = 'Downloading…';
   downloadBtn.style.pointerEvents = 'none';
@@ -2533,10 +2618,10 @@ downloadBtn.addEventListener('click', async e => {
       _lastServerResult = { ...sig, blob };
     }
     const url  = URL.createObjectURL(blob);
-    Object.assign(document.createElement('a'), { href: url, download: 'stitched.jpg' }).click();
+    Object.assign(document.createElement('a'), { href: url, download: _downloadName() }).click();
     setTimeout(() => URL.revokeObjectURL(url), 2000);
   } catch (err) {
-    statusEl.textContent = 'Download error: ' + err.message;
+    showError('Download failed: ' + err.message);
   } finally {
     downloadBtn.textContent = prev;
     downloadBtn.style.pointerEvents = '';
