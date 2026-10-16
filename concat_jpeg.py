@@ -19,6 +19,7 @@ preserves EXIF from the first source image.
 """
 
 import argparse
+import concurrent.futures
 import io
 import os
 import re
@@ -26,7 +27,6 @@ import shutil
 import struct
 import subprocess
 import sys
-import tempfile
 
 try:
     from PIL import Image, ImageOps
@@ -122,29 +122,12 @@ def _jpeg_params(path):
     subsampling — 0/1/2 (4:4:4 / 4:2:2 / 4:2:0) from the SOF marker.
     is_grayscale — True when the JPEG SOF marker has exactly 1 component.
     """
-    qtables = None
-    quality = 85
-    subsampling = 2
-    is_grayscale = False
-
     try:
         with open(path, "rb") as f:
             raw = f.read()
-
-        subsampling = _parse_sof_subsampling(raw)
-        _img = Image.open(path)
-        is_grayscale = (_img.mode == "L")
-        if _img.quantization:
-            qtables = _img.quantization
-            tbl = qtables.get(0, [])
-            if len(tbl) == 64:
-                s = sum(tbl[k] * 100 / _STD_LUMA[k] for k in range(64)) / 64
-                q = (200 - s) / 2 if s <= 100 else 5000 / s
-                quality = max(1, min(95, round(q)))
-    except Exception:
-        pass
-
-    return qtables, quality, subsampling, is_grayscale
+    except OSError:
+        return None, 85, 2, False
+    return _jpeg_params_from_bytes(raw)
 
 
 def _jpeg_params_from_bytes(raw):
@@ -193,6 +176,35 @@ def _jpeg_params_from_image(img):
             quality = max(1, min(95, round(q)))
 
     return qtables, quality, subsampling, is_grayscale
+
+
+def _decode_rgb(raw):
+    """Decode image bytes to an upright RGB Image.
+
+    Equivalent to ImageOps.exif_transpose(Image.open(...)).convert("RGB"),
+    minus the two full-resolution copies that chain makes when the image is
+    already upright and already RGB (the common case for camera JPEGs).
+    """
+    img = Image.open(io.BytesIO(raw))
+    img.load()
+    if img.getexif().get(0x0112, 1) != 1:
+        img = ImageOps.exif_transpose(img)
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    return img
+
+
+# Pillow releases the GIL while decoding/encoding, so a thread pool decodes
+# several large images concurrently.
+_DECODE_WORKERS = min(8, os.cpu_count() or 1)
+
+
+def _decode_many(raws):
+    """_decode_rgb over a list of byte strings, in parallel, preserving order."""
+    if len(raws) <= 1:
+        return [_decode_rgb(r) for r in raws]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(_DECODE_WORKERS, len(raws))) as ex:
+        return list(ex.map(_decode_rgb, raws))
 
 
 # ── jpegtran lossless fast-path ───────────────────────────────────────────────
@@ -249,41 +261,41 @@ def _try_lossless(image_paths, images, input_formats, output_path, direction, qt
             if y % mcu_h != 0:
                 return False
 
-    with tempfile.TemporaryDirectory() as td:
-        # Build a blank black canvas JPEG with the source's quantization tables
+    # Build a blank black canvas JPEG with the source's quantization tables
+    if direction == "horizontal":
+        canvas_size = (sum(img.width for img in images), max(img.height for img in images))
+    else:
+        canvas_size = (max(img.width for img in images), sum(img.height for img in images))
+
+    canvas_buf = io.BytesIO()
+    blank = Image.new("RGB", canvas_size, (0, 0, 0))
+    if qtables:
+        blank.save(canvas_buf, "JPEG", qtables=qtables, subsampling=subsampling)
+    else:
+        blank.save(canvas_buf, "JPEG", quality=85, subsampling=subsampling)
+    current = canvas_buf.getvalue()
+    del blank, canvas_buf
+
+    # Drop each source image into the canvas at its offset (DCT-level, no
+    # re-encode). The growing canvas is piped through stdin/stdout rather
+    # than staged in temp files.
+    # -copy all: metadata from the first source image is preserved
+    x = y = 0
+    for path, img in zip(image_paths, images):
+        result = subprocess.run(
+            [jpegtran, "-copy", "all", "-drop", f"+{x}+{y}", path],
+            input=current, capture_output=True,
+        )
+        if result.returncode != 0 or not result.stdout:
+            return False
+        current = result.stdout
         if direction == "horizontal":
-            canvas_size = (sum(img.width for img in images), max(img.height for img in images))
+            x += img.width
         else:
-            canvas_size = (max(img.width for img in images), sum(img.height for img in images))
+            y += img.height
 
-        canvas_path = os.path.join(td, "canvas.jpg")
-        blank = Image.new("RGB", canvas_size, (0, 0, 0))
-        if qtables:
-            blank.save(canvas_path, "JPEG", qtables=qtables, subsampling=subsampling)
-        else:
-            blank.save(canvas_path, "JPEG", quality=85, subsampling=subsampling)
-
-        # Drop each source image into the canvas at its offset (DCT-level, no re-encode)
-        # -copy all: metadata from the first source image is preserved
-        current = canvas_path
-        x = y = 0
-        for idx, (path, img) in enumerate(zip(image_paths, images)):
-            out_path = os.path.join(td, f"step_{idx}.jpg")
-            result = subprocess.run(
-                [jpegtran, "-copy", "all", "-drop", f"+{x}+{y}", path, current],
-                capture_output=True,
-            )
-            if result.returncode != 0 or not result.stdout:
-                return False
-            with open(out_path, "wb") as fout:
-                fout.write(result.stdout)
-            current = out_path
-            if direction == "horizontal":
-                x += img.width
-            else:
-                y += img.height
-
-        shutil.copy(current, output_path)
+    with open(output_path, "wb") as fout:
+        fout.write(current)
 
     return True
 
@@ -561,13 +573,23 @@ def concat_images(image_paths, output_path=None, direction="auto", order="auto",
 
     output_path may be None — the path is auto-generated next to the first input.
     """
-    _first = Image.open(image_paths[0])
+    # Read every input exactly once; headers, encoding params and pixels all
+    # come from these bytes.
+    raws = []
+    for p in image_paths:
+        with open(p, "rb") as f:
+            raws.append(f.read())
+    raw_of = dict(zip(image_paths, raws))
+    heads = [Image.open(io.BytesIO(r)) for r in raws]  # header-only, no pixel decode
+
+    _first = heads[0]
     _first_format = _first.format
     _first_exif = _first.info.get('exif') if _first_format == "JPEG" else None
     if _first_exif and _first.getexif().get(0x0112, 1) != 1:
         # Pixels get exif_transpose'd below, so the copied EXIF must not ask
         # viewers to rotate them a second time.
-        _ex = _first.getexif()
+        _ex = Image.Exif()  # fresh copy: getexif() is cached on the image
+        _ex.load(_first_exif)
         _ex[0x0112] = 1
         _first_exif = _ex.tobytes()
 
@@ -582,19 +604,11 @@ def concat_images(image_paths, output_path=None, direction="auto", order="auto",
             candidate = os.path.join(out_dir, f"{stem}_{n}{ext}")
             n += 1
         output_path = candidate
-    _first.close()
 
-    images = []
-    input_formats = []
+    input_formats = [h.format for h in heads]
     # jpegtran -drop works on the stored (unrotated, unresized) DCT data, so
     # the lossless path is only valid when the decoded pixels match the file.
-    pixels_differ_from_file = False
-    for p in image_paths:
-        with Image.open(p) as img:
-            input_formats.append(img.format)
-            if img.getexif().get(0x0112, 1) != 1:
-                pixels_differ_from_file = True
-            images.append(ImageOps.exif_transpose(img).convert("RGB"))
+    pixels_differ_from_file = any(h.getexif().get(0x0112, 1) != 1 for h in heads)
 
     preserve_order  = (order != "auto")
     fix_direction = None if direction == "auto" else direction
@@ -604,6 +618,13 @@ def concat_images(image_paths, output_path=None, direction="auto", order="auto",
         and len(image_paths) == 2
         and (not preserve_order or fix_direction is None)  # at least one thing to decide
     )
+
+    # Ordering, direction and the lossless path only need dimensions, so
+    # full-resolution decoding is deferred until pixels are actually needed
+    # (seam matching, a --fit resize, or the Pillow re-encode). Header
+    # dimensions equal decoded ones only when no EXIF rotation applies.
+    decoded = use_edge_match or pixels_differ_from_file
+    images = _decode_many(raws) if decoded else heads
 
     if use_edge_match:
         image_paths, images, direction = find_best_arrangement_2(
@@ -636,6 +657,13 @@ def concat_images(image_paths, output_path=None, direction="auto", order="auto",
     if fit:
         pre_fit_sizes = [img.size for img in images]
         if direction == "horizontal":
+            needs_resize = len({img.height for img in images}) > 1
+        else:
+            needs_resize = len({img.width for img in images}) > 1
+        if needs_resize and not decoded:
+            images = _decode_many([raw_of[p] for p in image_paths])
+            decoded = True
+        if direction == "horizontal":
             target_h = max(img.height for img in images)
             images = [
                 img.resize((round(img.width * target_h / img.height), target_h), Image.LANCZOS)
@@ -658,17 +686,16 @@ def concat_images(image_paths, output_path=None, direction="auto", order="auto",
     qtables = quality = subsampling = None
     is_grayscale = False
     if input_formats[0] == "JPEG":
-        qtables, quality, subsampling, is_grayscale = _jpeg_params(first)
+        qtables, quality, subsampling, is_grayscale = _jpeg_params_from_bytes(raw_of[first])
     else:
         qtables, quality, subsampling = None, 85, 2
 
     all_subsampling = None
-    if _HAS_NUMPY and len(image_paths) > 1 and input_formats[0] == "JPEG":
+    if len(image_paths) > 1 and input_formats[0] == "JPEG":
         all_subsampling = [subsampling]
         for i in range(1, len(image_paths)):
             if input_formats[i] == "JPEG":
-                _, _, s, _ = _jpeg_params(image_paths[i])
-                all_subsampling.append(s)
+                all_subsampling.append(_parse_sof_subsampling(raw_of[image_paths[i]]))
             else:
                 all_subsampling.append(2)
 
@@ -685,6 +712,8 @@ def concat_images(image_paths, output_path=None, direction="auto", order="auto",
 
     # ── Pillow re-encode fallback ─────────────────────────────────────────────
     if not lossless:
+        if not decoded:
+            images = _decode_many([raw_of[p] for p in image_paths])
         if direction == "horizontal":
             total_w = sum(img.width  for img in images) - overlap * (len(images) - 1)
             total_h = max(img.height for img in images)
@@ -2329,9 +2358,9 @@ def _stitch_grid(layout, paths, td, fit=False, overlap=0, overlap_blend="hard", 
     Composite a 2D grid of images into a single JPEG.
 
     layout     — 2D list of file IDs (strings) or None for empty cells
-    paths      — {id: absolute_path}
-    td         — temp directory used for input staging by the caller (kept for
-                 signature compatibility; the output is produced in memory)
+    paths      — {id: absolute_path}; only read for ids missing from preopened
+    td         — unused (kept for signature compatibility; the output is
+                 produced in memory)
     preopened  — optional {id: Image} of already-decoded (EXIF-transposed, RGB)
                  images, used instead of re-opening from paths to avoid a
                  second full-resolution decode (e.g. after auto-overlap
@@ -2369,7 +2398,10 @@ def _stitch_grid(layout, paths, td, fit=False, overlap=0, overlap_blend="hard", 
         grid_row = []
         for c, fid in enumerate(row):
             if fid and fid in paths:
-                img = preopened.get(fid) or ImageOps.exif_transpose(Image.open(paths[fid])).convert("RGB")
+                img = preopened.get(fid)
+                if img is None:
+                    with open(paths[fid], "rb") as fh:
+                        img = _decode_rgb(fh.read())
                 if first_path is None:
                     first_path = paths[fid]
                     first_fid = fid
@@ -2559,51 +2591,42 @@ def _create_web_app(on_quit=None):
         overlap_raw   = request.form.get("overlap", "0")
         overlap_blend = request.form.get("overlap_blend", "hard")
 
-        with tempfile.TemporaryDirectory() as td:
-            paths = {}
-            for key, f in request.files.items():
-                safe_key = re.sub(r'[^A-Za-z0-9_-]', '_', key)[:64]
-                ext = os.path.splitext(f.filename)[1] or ".jpg"
-                ext = re.sub(r'[^A-Za-z0-9.]', '', ext)[:16]
-                dest = os.path.join(td, safe_key + ext)
-                f.save(dest)
-                paths[key] = dest
+        # Only uploads the layout actually references are read, and they stay
+        # in memory: no temp-file write + re-read round trip. Each one is
+        # decoded once (in parallel) and its JPEG encoding params are taken
+        # from the same bytes, so _stitch_grid never touches the disk.
+        referenced = []
+        for row in layout:
+            for fid in row:
+                if fid and fid in request.files and fid not in referenced:
+                    referenced.append(fid)
+        raws = [request.files[fid].read() for fid in referenced]
+        try:
+            decoded = _decode_many(raws)
+        except Exception:
+            abort(400, "Could not decode one of the images")
+        opened = dict(zip(referenced, decoded))
+        opened_params = {fid: _jpeg_params_from_bytes(raw) for fid, raw in zip(referenced, raws)}
+        paths = {fid: request.files[fid].filename or fid for fid in referenced}
+        del raws
 
-            # Decode each referenced image at most once, and hand the opened
-            # images straight to _stitch_grid so it doesn't re-decode them.
-            # Also extract JPEG encoding params from the same raw bytes used
-            # for the decode, so _stitch_grid doesn't need a second disk read
-            # of whichever image ends up being "first" in scan order.
-            opened = {}
-            opened_params = {}
-            for row in layout:
-                for fid in row:
-                    if fid and fid in paths and fid not in opened:
-                        try:
-                            with open(paths[fid], "rb") as fh:
-                                raw = fh.read()
-                            opened_params[fid] = _jpeg_params_from_bytes(raw)
-                            opened[fid] = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
-                        except Exception:
-                            pass
+        if overlap_raw == "auto":
+            n_rows = len(layout)
+            direction = "horizontal" if n_rows == 1 else "vertical"
+            imgs = [opened[fid] for row in layout for fid in row if fid in opened]
+            overlap = _suggest_overlap(imgs, direction) if len(imgs) >= 2 else 0
+        else:
+            try:
+                overlap = max(0, int(overlap_raw))
+            except (ValueError, TypeError):
+                overlap = 0
 
-            if overlap_raw == "auto":
-                n_rows = len(layout)
-                direction = "horizontal" if n_rows == 1 else "vertical"
-                imgs = [opened[fid] for row in layout for fid in row if fid in opened]
-                overlap = _suggest_overlap(imgs, direction) if len(imgs) >= 2 else 0
-            else:
-                try:
-                    overlap = max(0, int(overlap_raw))
-                except (ValueError, TypeError):
-                    overlap = 0
-
-            buf, overlap = _stitch_grid(
-                layout, paths, td, fit=fit, overlap=overlap, overlap_blend=overlap_blend,
-                preopened=opened, preopened_params=opened_params,
-            )
-            if buf is None:
-                abort(500, "Nothing to stitch")
+        buf, overlap = _stitch_grid(
+            layout, paths, None, fit=fit, overlap=overlap, overlap_blend=overlap_blend,
+            preopened=opened, preopened_params=opened_params,
+        )
+        if buf is None:
+            abort(500, "Nothing to stitch")
         return buf, overlap, overlap_blend
 
     @app.route("/stitch", methods=["POST"])

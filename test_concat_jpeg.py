@@ -486,6 +486,36 @@ class TestLosslessPath:
         assert result.getpixel((160, 100))[2] < 80      # yellow
         assert result.getpixel((160, 400))[2] > 180     # blue
 
+    @pytest.mark.skipif(not __import__("shutil").which("jpegtran"), reason="jpegtran not installed")
+    def test_lossless_path_skips_pixel_decode(self, tmpdir):
+        """3+ MCU-aligned JPEGs need only header dimensions; the lossless path
+        must not pay for a full-resolution decode it never uses."""
+        paths = []
+        for i, color in enumerate([(255, 0, 0), (0, 255, 0), (0, 0, 255)]):
+            p = os.path.join(tmpdir, f"img_{i}.jpg")
+            Image.new("RGB", (64, 96), color).save(p, "JPEG", quality=85, subsampling=2)
+            paths.append(p)
+        output = os.path.join(tmpdir, "out.jpg")
+        with patch.object(cj, "_decode_rgb", side_effect=AssertionError("decoded")):
+            cj.concat_images(paths, output, direction="horizontal", order="as-given")
+        result = Image.open(output).convert("RGB")
+        assert result.size == (192, 96)
+        assert result.getpixel((160, 48))[2] > 200  # third image is blue
+
+    def test_pillow_fallback_decodes_lazily(self, tmpdir):
+        """When lossless can't run, deferred decoding still produces the image."""
+        paths = []
+        for i, color in enumerate([(255, 0, 0), (0, 255, 0), (0, 0, 255)]):
+            p = os.path.join(tmpdir, f"img_{i}.jpg")
+            Image.new("RGB", (61, 95), color).save(p, "JPEG", quality=85)
+            paths.append(p)
+        output = os.path.join(tmpdir, "out.jpg")
+        cj.concat_images(paths, output, direction="horizontal", order="as-given")
+        result = Image.open(output).convert("RGB")
+        assert result.size == (183, 95)
+        assert result.getpixel((30, 47))[0] > 200
+        assert result.getpixel((152, 47))[2] > 200
+
     def test_lossless_not_taken_without_jpegtran(self, tmpdir):
         """No jpegtran → _try_lossless returns False."""
         paths = self._mcu_aligned_images(tmpdir)
