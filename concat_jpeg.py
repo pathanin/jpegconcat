@@ -1201,7 +1201,9 @@ body.loading, body.loading * { cursor: progress !important; }
   z-index: 4;
 }
 
-.cell:hover .btn-remove { opacity: 1; }
+.cell:hover .btn-remove,
+.cell:focus-within .btn-remove { opacity: 1; }
+.cell:focus-visible { outline: 2px solid #0071e3; outline-offset: 2px; }
 .btn-remove:hover { background: #dc2626; color: #fff; }
 
 .cell-toolbar {
@@ -1221,7 +1223,33 @@ body.loading, body.loading * { cursor: progress !important; }
   border-radius: 0 0 4px 4px;
 }
 
-.cell:hover .cell-toolbar { opacity: 1; }
+.cell:hover .cell-toolbar,
+.cell:focus-within .cell-toolbar { opacity: 1; }
+
+#toast {
+  position: fixed;
+  left: 50%;
+  bottom: 76px;
+  transform: translateX(-50%) translateY(12px);
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 8px 8px 8px 18px;
+  background: rgba(245,245,247,0.85);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid #e0e0e0;
+  border-radius: 9999px;
+  font-size: 14px;
+  letter-spacing: -0.224px;
+  color: #1d1d1f;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s, transform 0.15s;
+  z-index: 150;
+}
+#toast.visible { opacity: 1; transform: translateX(-50%); pointer-events: auto; }
+#toast kbd { font-family: inherit; color: #7a7a7a; }
 
 .btn-transform {
   width: 24px;
@@ -1394,7 +1422,8 @@ body.loading, body.loading * { cursor: progress !important; }
   transition: border-color 0.12s, color 0.12s, background 0.12s;
   white-space: nowrap;
 }
-#quit-btn:hover:not(:disabled) { border-color: #dc2626; color: #dc2626; }
+#quit-btn:hover:not(:disabled) { border-color: #1d1d1f; }
+#quit-btn.armed { background: #1d1d1f; border-color: #1d1d1f; color: #fff; }
 #quit-btn:disabled { color: #999; cursor: default; }
 #quit-btn:focus-visible {
   outline: 2px solid #0071e3;
@@ -1482,8 +1511,8 @@ body.loading, body.loading * { cursor: progress !important; }
       </label>
     </div>
     <button id="add-images-btn" class="ghost-btn" style="display:none" title="Add more images to the end">Add Images</button>
-    <button id="stitch-btn" disabled>Stitch &amp; Preview</button>
-    <button id="quit-btn" title="Stop the Image Stitcher server">Quit</button>
+    <button id="stitch-btn" disabled title="Stitch at full quality (⌘↵)">Stitch &amp; Preview</button>
+    <button id="quit-btn" title="Stop the Image Stitcher server (click twice)">Quit</button>
   </div>
 </header>
 
@@ -1530,6 +1559,11 @@ body.loading, body.loading * { cursor: progress !important; }
       <a id="download-btn" download="stitched.jpg">Download</a>
     </div>
   </div>
+</div>
+
+<div id="toast" role="status" aria-live="polite">
+  <span id="toast-msg"></span>
+  <button id="toast-undo" class="ghost-btn">Undo <kbd>⌘Z</kbd></button>
 </div>
 
 <div id="stopped" role="status" aria-live="polite">
@@ -1731,11 +1765,41 @@ function insertRow(after) {
   grid.splice(after + 1, 0, Array(nCols()).fill(null));
 }
 
+// One level of undo for Remove. The removed cell isn't disposed until
+// the undo window closes, so restoring it needs no re-decode.
+let _undo = null;   // { grid, cell, timer }
+const UNDO_MS = 8000;
+const toastEl  = document.getElementById('toast');
+const toastMsg = document.getElementById('toast-msg');
+
+function _finalizeUndo() {
+  if (!_undo) return;
+  clearTimeout(_undo.timer);
+  _disposeCell(_undo.cell);
+  _undo = null;
+  toastEl.classList.remove('visible');
+}
+
 function removeCell(r, c) {
-  _disposeCell(grid[r][c]);
+  _finalizeUndo();
+  const cell = grid[r][c];
+  if (!cell) return;
+  _undo = { grid: grid.map(row => row.slice()), cell, timer: setTimeout(_finalizeUndo, UNDO_MS) };
+  toastMsg.textContent = `Removed ${cell.name}`;
+  toastEl.classList.add('visible');
   grid[r][c] = null;
   compact();
 }
+
+function undoRemove() {
+  if (!_undo) return;
+  clearTimeout(_undo.timer);
+  grid = _undo.grid;
+  _undo = null;
+  toastEl.classList.remove('visible');
+  render();
+}
+document.getElementById('toast-undo').addEventListener('click', undoRemove);
 
 function compact() {
   grid = grid.filter(row => row.some(Boolean));
@@ -1894,6 +1958,7 @@ async function appendFiles(files) {
 async function initFromFiles(files) {
   const cells = await makeCells(files);
   if (!cells.length) return;
+  _finalizeUndo();  // the old grid is going away; nothing to undo into
   for (const row of grid) for (const old of row) _disposeCell(old);
   grid = [cells];
   render();
@@ -2016,6 +2081,19 @@ function buildCell(cell, r, c) {
   const el = document.createElement('div');
   el.className = 'cell';
   el.draggable = true;
+  el.tabIndex = 0;
+  el.setAttribute('aria-label', `${cell.name}, row ${r + 1}, column ${c + 1}. Delete to remove.`);
+  el.addEventListener('keydown', e => {
+    if (e.target !== el) return;
+    if (e.key === 'Delete' || e.key === 'Backspace') {
+      e.preventDefault();
+      removeCell(r, c);
+      render();
+      // Keep keyboard focus in the grid.
+      const next = gridEl.querySelector('.cell:not(.empty)');
+      if (next) next.focus();
+    }
+  });
   el.dataset.r = r;
   el.dataset.c = c;
 
@@ -2570,9 +2648,36 @@ stitchBtn.addEventListener('click', async () => {
   }
 });
 
+document.addEventListener('keydown', e => {
+  const mod = e.metaKey || e.ctrlKey;
+  if (!mod) return;
+  if (e.key === 'z' && !e.shiftKey && _undo) { e.preventDefault(); undoRemove(); }
+  else if (e.key === 'Enter' && !stitchBtn.disabled) { e.preventDefault(); stitchBtn.click(); }
+  else if (e.key === 'o') { e.preventDefault(); openPicker(); }
+});
+
 const quitBtn   = document.getElementById('quit-btn');
 const stoppedEl = document.getElementById('stopped');
+// Two-step: the first click arms the button, a second within 3 s quits.
+// (An in-page confirm, not window.confirm.)
+let _quitArmTimer = null;
+function _disarmQuit() {
+  clearTimeout(_quitArmTimer);
+  _quitArmTimer = null;
+  quitBtn.classList.remove('armed');
+  quitBtn.textContent = 'Quit';
+}
+quitBtn.addEventListener('blur', () => { if (_quitArmTimer) _disarmQuit(); });
 quitBtn.addEventListener('click', async () => {
+  if (!_quitArmTimer) {
+    quitBtn.classList.add('armed');
+    quitBtn.textContent = 'Click again to quit';
+    _quitArmTimer = setTimeout(_disarmQuit, 3000);
+    return;
+  }
+  clearTimeout(_quitArmTimer);
+  _quitArmTimer = null;
+  quitBtn.classList.remove('armed');
   quitBtn.disabled = true;
   quitBtn.textContent = 'Quitting…';
   try {
