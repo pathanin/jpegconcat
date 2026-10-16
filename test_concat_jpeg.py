@@ -876,3 +876,23 @@ class TestWebUIScript:
         used = set(re.findall(r"getElementById\('([^']+)'\)", self._script()))
         assert used, "expected getElementById lookups in the script"
         assert used <= ids, f"script looks up missing ids: {sorted(used - ids)}"
+
+
+# ── Tests: embedded web UI ────────────────────────────────────────────────────
+
+class TestWebUIHtml:
+    def test_every_element_lookup_has_a_matching_id(self):
+        """A getElementById for a removed element returns null and throws at
+        load, breaking the whole UI — pytest never runs the JS, so check here."""
+        import re
+        html = cj._WEB_UI_HTML
+        looked_up = set(re.findall(r"getElementById\('([^']+)'\)", html))
+        defined = set(re.findall(r'\bid="([^"]+)"', html))
+        assert looked_up, "expected some getElementById calls"
+        assert looked_up <= defined, f"missing ids: {sorted(looked_up - defined)}"
+
+    def test_overlap_defaults_to_zero(self):
+        import re
+        html = cj._WEB_UI_HTML
+        assert re.search(r'id="overlap-slider"[^>]*value="0"', html)
+        assert '<span id="overlap-val">0 px</span>' in html

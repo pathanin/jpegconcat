@@ -40,7 +40,7 @@ jpegconcat
 ```
 
 Opens a drag-and-drop interface at `http://localhost:5001`. Drop images anywhere
-on the page to build a grid, then click **Stitch & Download**.
+on the page to build a grid, then click **Download**.
 
 **Grid building:**
 - Drop an image onto the **left or right edge** of a cell → inserts a new column

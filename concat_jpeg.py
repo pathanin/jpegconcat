@@ -914,7 +914,7 @@ h1 {
   transform: translateX(16px);
 }
 
-#stitch-btn, .ghost-btn, #quit-btn, #download-btn {
+.ghost-btn, #quit-btn, #download-btn {
   height: 36px;
   padding: 0 18px;
   display: inline-flex;
@@ -925,30 +925,6 @@ h1 {
   letter-spacing: -0.224px;
   line-height: 1;
   flex-shrink: 0;
-}
-
-#stitch-btn {
-  background: #0066cc;
-  color: #fff;
-  border: none;
-  border-radius: 9999px;
-  font-family: inherit;
-  font-weight: 400;
-  cursor: pointer;
-  transition: opacity 0.12s, transform 0.08s;
-  white-space: nowrap;
-}
-
-#stitch-btn:hover:not(:disabled) { opacity: 0.85; }
-#stitch-btn:active:not(:disabled) { transform: scale(0.95); }
-#stitch-btn:disabled {
-  background: #e0e0e0;
-  color: #7a7a7a;
-  cursor: default;
-}
-#stitch-btn:focus-visible {
-  outline: 2px solid #0071e3;
-  outline-offset: 2px;
 }
 
 #app-body {
@@ -1027,9 +1003,8 @@ h1 {
 }
 
 #preview-pane[data-state="final"] #preview-caption { color: #1d1d1f; }
-#preview-pane[data-state="stale"] #preview-caption { color: #1d1d1f; font-weight: 600; }
-#preview-pane[data-state="stale"] #preview-img,
-#preview-pane[data-state="stale"] #preview-live { opacity: 0.35; transition: opacity 0.15s; }
+#preview-pane[data-state="pending"] #preview-img,
+#preview-pane[data-state="pending"] #preview-live { opacity: 0.35; transition: opacity 0.15s; }
 
 #status.error { color: #1d1d1f; font-weight: 600; }
 body.loading, body.loading * { cursor: progress !important; }
@@ -1049,19 +1024,19 @@ body.loading, body.loading * { cursor: progress !important; }
 .ghost-btn:focus-visible { outline: 2px solid #0071e3; outline-offset: 2px; }
 
 #download-btn {
-  background: transparent;
-  color: #0066cc;
-  border: 1px solid #0066cc;
+  background: #0066cc;
+  color: #fff;
+  border: none;
   border-radius: 9999px;
   font-family: inherit;
   font-weight: 400;
   cursor: pointer;
   text-decoration: none;
-  transition: background 0.12s, transform 0.08s;
+  transition: opacity 0.12s, transform 0.08s;
   white-space: nowrap;
 }
 
-#download-btn:hover { background: rgba(0,102,204,0.06); }
+#download-btn:hover { opacity: 0.85; }
 #download-btn:active { transform: scale(0.95); }
 #download-btn:focus-visible {
   outline: 2px solid #0071e3;
@@ -1536,10 +1511,10 @@ body.loading, body.loading * { cursor: progress !important; }
       <span>Overlap</span>
       <input type="range" id="overlap-slider" min="0" max="800" value="0" step="1">
       <button id="overlap-dec-btn" class="overlap-step-btn" title="Decrease by 1px">−</button>
-      <span id="overlap-val">Auto</span>
+      <span id="overlap-val">0 px</span>
       <button id="overlap-inc-btn" class="overlap-step-btn" title="Increase by 1px">+</button>
       <button id="zoom-toggle-btn" class="overlap-step-btn text-btn" title="Zoom into the seam edge">Zoom</button>
-      <button id="overlap-auto-btn" class="active" title="Re-detect best overlap">Auto</button>
+      <button id="overlap-auto-btn" title="Detect the best overlap for these images">Auto</button>
       <label class="fit-toggle-label" title="Cross-fade blend instead of hard paste">
         <input type="checkbox" id="overlap-fade-toggle" class="fit-toggle-input">
         <span class="fit-toggle-switch"></span>
@@ -1548,7 +1523,6 @@ body.loading, body.loading * { cursor: progress !important; }
     </div>
     </div>
     <button id="add-images-btn" class="ghost-btn" style="display:none" title="Add more images to the end">Add Images</button>
-    <button id="stitch-btn" disabled title="Stitch at full quality (⌘↵)">Stitch &amp; Preview</button>
     <button id="quit-btn" title="Stop the Image Stitcher server (click twice)">Quit</button>
   </div>
 </header>
@@ -1593,7 +1567,7 @@ body.loading, body.loading * { cursor: progress !important; }
     </div>
     <div id="preview-footer">
       <span id="preview-caption"></span>
-      <a id="download-btn" download="stitched.jpg">Download</a>
+      <a id="download-btn" download="stitched.jpg" title="Save the full-quality JPEG (⌘↵)">Download</a>
     </div>
   </div>
 </div>
@@ -1633,7 +1607,6 @@ const addLeftBtn    = document.getElementById('add-left-btn');
 const addRightBtn   = document.getElementById('add-right-btn');
 const addTopBtn     = document.getElementById('add-top-btn');
 const addBottomBtn  = document.getElementById('add-bottom-btn');
-const stitchBtn     = document.getElementById('stitch-btn');
 const addImagesBtn  = document.getElementById('add-images-btn');
 const optionsEl     = document.getElementById('options');
 const statusEl      = document.getElementById('status');
@@ -1652,7 +1625,6 @@ const zoomToggleBtn     = document.getElementById('zoom-toggle-btn');
 const zoomPanel         = document.getElementById('zoom-panel');
 const zoomCanvas        = document.getElementById('zoom-canvas');
 
-let overlapIsAuto   = true;
 let _zoomActive     = false;
 let _zoomLevel      = 3;
 let _zoomOffsetX    = null;   // null = re-center on next render
@@ -1665,36 +1637,46 @@ function _setOverlapPx(px) {
 }
 
 overlapSlider.addEventListener('input', () => {
-  overlapIsAuto = false;
-  overlapAutoBtn.classList.remove('active');
   overlapValEl.textContent = overlapSlider.value + ' px';
-  scheduleLivePreview();
+  onLayoutChanged();
 });
 
-// Auto overlap is detected server-side, so clicking Auto runs a stitch to
-// get the value — otherwise the button would look like it did nothing.
-overlapAutoBtn.addEventListener('click', () => {
-  overlapIsAuto = true;
-  overlapAutoBtn.classList.add('active');
-  overlapValEl.textContent = 'Auto';
-  updateStatus();
-  if (imgCount() >= 2) stitchBtn.click();
+// Auto is a one-shot detection, not a mode: the server suggests a value,
+// which then lands on the slider like any manual setting. (A sticky "auto"
+// would re-detect on Download and could save something the preview never
+// showed.)
+overlapAutoBtn.addEventListener('click', async () => {
+  if (imgCount() < 2) return;
+  _statusError = null;
+  overlapAutoBtn.disabled = true;
+  overlapAutoBtn.textContent = 'Detecting…';
+  try {
+    const fd = _buildFormData();
+    fd.set('overlap', 'auto');
+    const res = await fetch('/preview', { method: 'POST', body: fd });
+    if (!res.ok) throw new Error(await res.text().catch(() => res.statusText));
+    const px = parseInt(res.headers.get('X-Overlap-Px'), 10);
+    if (!Number.isNaN(px)) _setOverlapPx(px);
+    onLayoutChanged();
+  } catch (err) {
+    showError('Overlap detection failed: ' + err.message);
+  } finally {
+    overlapAutoBtn.disabled = false;
+    overlapAutoBtn.textContent = 'Auto';
+  }
 });
 
 document.getElementById('fit-toggle').addEventListener('change', () => onLayoutChanged());
 
 function _stepOverlap(delta) {
   const v = Math.min(parseInt(overlapSlider.max), Math.max(0, parseInt(overlapSlider.value) + delta));
-  overlapSlider.value = v;
-  overlapIsAuto = false;
-  overlapAutoBtn.classList.remove('active');
-  overlapValEl.textContent = v + ' px';
-  scheduleLivePreview();
+  _setOverlapPx(v);
+  onLayoutChanged();
 }
 overlapDecBtn.addEventListener('click', () => _stepOverlap(-1));
 overlapIncBtn.addEventListener('click', () => _stepOverlap( 1));
 
-overlapFadeToggle.addEventListener('change', () => { scheduleLivePreview(); });
+overlapFadeToggle.addEventListener('change', () => onLayoutChanged());
 
 zoomToggleBtn.addEventListener('click', () => {
   _zoomActive  = !_zoomActive;
@@ -2023,7 +2005,6 @@ function render() {
   if (!hasImages()) {
     gridOuter.style.display = 'none';
     dropZoneEl.style.display = 'flex';
-    stitchBtn.disabled = true;
     overlapCtrl.style.display = 'none';
     addImagesBtn.style.display = 'none';
     optionsEl.style.display = 'none';
@@ -2043,7 +2024,6 @@ function render() {
     }
   }
   const n = imgCount();
-  stitchBtn.disabled = n < 2;
   addImagesBtn.style.display = '';
   optionsEl.style.display = n >= 2 ? 'flex' : 'none';
   // Overlap only applies to single-row or single-column grids — _stitch_grid
@@ -2051,6 +2031,13 @@ function render() {
   // would have no effect.
   const overlapApplies = rows === 1 || cols === 1;
   overlapCtrl.style.display = (n >= 2 && overlapApplies) ? 'flex' : 'none';
+  // The seam zoom is only drawn for side-by-side seams.
+  zoomToggleBtn.style.display = rows === 1 ? '' : 'none';
+  if (rows !== 1 && _zoomActive) {
+    _zoomActive = false;
+    zoomToggleBtn.classList.remove('active');
+    zoomPanel.style.display = 'none';
+  }
   // The seam zoom only draws for side-by-side layouts.
   const zoomApplies = rows === 1;
   zoomToggleBtn.style.display = zoomApplies ? '' : 'none';
@@ -2079,8 +2066,7 @@ function updateStatus() {
   const n = imgCount();
   let s = `${n} image${n !== 1 ? 's' : ''} · ${nRows()}×${nCols()} grid`;
   if (overlapCtrl.style.display !== 'none') {
-    s += overlapIsAuto && overlapValEl.textContent === 'Auto' ? ' · auto overlap'
-                                                            : ` · ${overlapSlider.value}px overlap`;
+    s += ` · ${overlapSlider.value}px overlap`;
   }
   statusEl.textContent = s;
 }
@@ -2090,12 +2076,12 @@ const previewCaption = document.getElementById('preview-caption');
 
 // 'live'  — fast client-side composite (downscaled, not the final file)
 // 'final' — the server's real output for the current layout
-// 'stale' — showing an old result that no longer matches the grid
+// 'pending' — an old result is shown while the new one renders
 function _setPreviewState(state, text) {
   previewPane.dataset.state = state;
   previewCaption.textContent = text || {
-    live:  'Quick preview · Stitch & Preview shows the final file',
-    stale: 'Out of date · press Stitch & Preview to refresh',
+    live:    'Quick preview (reduced size) · Download saves full quality',
+    pending: 'Rendering…',
   }[state] || '';
 }
 
@@ -2118,9 +2104,11 @@ function onLayoutChanged() {
       _setPreviewState('final', _lastServerResult.caption || ' ');
       return;
     }
-    _previewGen++;
-    _setPreviewState('stale');
+    _setPreviewState('pending');
   }
+  // Grids with no client-side live preview get the server render instead,
+  // debounced so a burst of edits costs one request.
+  if (!_liveSupported()) scheduleServerPreview();
 }
 
 function buildCell(cell, r, c) {
@@ -2367,7 +2355,7 @@ function _buildFormData() {
   const layoutIds = grid.map(row => row.map(cell => cell ? cell.id : null));
   formData.append('layout', JSON.stringify(layoutIds));
   formData.append('fit', document.getElementById('fit-toggle').checked);
-  formData.append('overlap', overlapIsAuto ? 'auto' : overlapSlider.value);
+  formData.append('overlap', overlapSlider.value);
   formData.append('overlap_blend', overlapFadeToggle.checked ? 'fade' : 'hard');
   const seen = new Set();
   for (const row of grid) {
@@ -2398,7 +2386,7 @@ function _requestSignature() {
   const key = JSON.stringify([
     layoutIds,
     document.getElementById('fit-toggle').checked,
-    overlapIsAuto ? 'auto' : overlapSlider.value,
+    overlapSlider.value,
     overlapFadeToggle.checked,
   ]);
   return { key, files };
@@ -2564,9 +2552,13 @@ async function updateLivePreview() {
       : { ...e, w: maxW, h: e.w === maxW ? e.h : Math.round(e.h * maxW / e.w) });
   }
 
-  // _stitch_grid clamps overlap to one less than the smallest image.
+  // _stitch_grid clamps overlap to one less than the smallest image, so
+  // the slider never offers a value that wouldn't be applied.
   const minSide = Math.min(...entries.map(e => horizontal ? e.w : e.h));
-  const overlap = Math.min(Math.max(0, parseInt(overlapSlider.value) || 0), minSide - 1);
+  const maxOv = Math.max(0, minSide - 1);
+  if (+overlapSlider.max !== maxOv) overlapSlider.max = maxOv;
+  if ((parseInt(overlapSlider.value) || 0) > maxOv) _setOverlapPx(maxOv);
+  const overlap = Math.min(Math.max(0, parseInt(overlapSlider.value) || 0), maxOv);
 
   // Natural canvas size (from full-resolution dimensions)
   let natW, natH;
@@ -2607,7 +2599,7 @@ async function updateLivePreview() {
     const dw0 = Math.round(entries[0].w * scale);
     _lastZoomParams = { cv, dw0, ov, cvW, cvH };
     _renderZoomStrip(_lastZoomParams);
-  } else if (!_zoomActive) {
+  } else {
     zoomPanel.style.display = 'none';
   }
 
@@ -2645,61 +2637,56 @@ function _fmtSize(bytes) {
                               : Math.round(bytes / 1024) + ' KB';
 }
 
-function _syncOverlapFromResponse(res) {
-  const appliedOverlap = res.headers.get('X-Overlap-Px');
-  if (appliedOverlap !== null) {
-    const px = parseInt(appliedOverlap, 10);
-    _setOverlapPx(px);
-    if (overlapIsAuto) overlapAutoBtn.classList.add('active');
-  }
+// Full-quality server render, used as the preview for grids the live
+// composite can't draw. Runs automatically after edits; a sequence number
+// drops responses that a newer request has superseded.
+let _serverPreviewTimer = null;
+let _serverPreviewSeq = 0;
+function scheduleServerPreview() {
+  clearTimeout(_serverPreviewTimer);
+  if (imgCount() < 2) return;
+  _serverPreviewTimer = setTimeout(runServerPreview, 400);
 }
 
-stitchBtn.addEventListener('click', async () => {
-  if (!hasImages()) return;
-  _statusError = null;
-  processingEl.classList.add('visible');
-  stitchBtn.textContent = 'Stitching…';
-  stitchBtn.disabled = true;
+async function runServerPreview() {
+  if (imgCount() < 2) return;
+  const seq = ++_serverPreviewSeq;
+  const sig = _requestSignature();
+  if (appBody.classList.contains('has-preview')) _setPreviewState('pending');
   try {
-    const sig = _requestSignature();
     const res = await fetch('/preview', { method: 'POST', body: _buildFormData() });
     if (!res.ok) {
       const msg = await res.text().catch(() => res.statusText);
       throw new Error(`Server error ${res.status}: ${msg}`);
     }
-    _syncOverlapFromResponse(res);
     const blob = await res.blob();
+    if (seq !== _serverPreviewSeq) return;
     _lastServerResult = { ...sig, blob };
     _previewGen++;
     const liveDrawsAtResult = _liveDrawCount;
     if (_previewObjectURL) URL.revokeObjectURL(_previewObjectURL);
     _previewObjectURL = URL.createObjectURL(blob);
     previewImg.onload = () => {
-      if (_liveDrawCount !== liveDrawsAtResult) return;  // user moved on
+      if (_liveDrawCount !== liveDrawsAtResult || seq !== _serverPreviewSeq) return;
       const w = previewImg.naturalWidth, h = previewImg.naturalHeight;
-      _lastServerResult.caption = `Final · ${w} × ${h} px · ${_fmtSize(blob.size)}`;
+      _lastServerResult.caption = `${w} × ${h} px · ${_fmtSize(blob.size)}`;
       _showPreview(previewImg, w >= h);
-      // The grid may have changed while the request was in flight.
       if (_matchesLastServerResult(_requestSignature())) _setPreviewState('final', _lastServerResult.caption);
-      else _setPreviewState('stale');
+      else _setPreviewState('pending');
     };
     previewImg.src = _previewObjectURL;
-    updateStatus();
   } catch (err) {
+    if (seq !== _serverPreviewSeq) return;
     console.error(err);
-    showError('Stitch failed: ' + err.message);
-  } finally {
-    processingEl.classList.remove('visible');
-    stitchBtn.textContent = 'Stitch & Preview';
-    stitchBtn.disabled = imgCount() < 2;
+    showError('Preview failed: ' + err.message);
   }
-});
+}
 
 document.addEventListener('keydown', e => {
   const mod = e.metaKey || e.ctrlKey;
   if (!mod) return;
   if (e.key === 'z' && !e.shiftKey && _undo) { e.preventDefault(); undoRemove(); }
-  else if (e.key === 'Enter' && !stitchBtn.disabled) { e.preventDefault(); stitchBtn.click(); }
+  else if (e.key === 'Enter' && imgCount() >= 2) { e.preventDefault(); downloadBtn.click(); }
   else if (e.key === 'o') { e.preventDefault(); openPicker(); }
 });
 
@@ -2763,9 +2750,9 @@ downloadBtn.addEventListener('click', async e => {
     if (_matchesLastServerResult(sig)) {
       blob = _lastServerResult.blob;
     } else {
+      processingEl.classList.add('visible');
       const res = await fetch('/stitch', { method: 'POST', body: _buildFormData() });
       if (!res.ok) throw new Error(res.statusText);
-      _syncOverlapFromResponse(res);
       blob = await res.blob();
       _lastServerResult = { ...sig, blob };
     }
@@ -2775,6 +2762,7 @@ downloadBtn.addEventListener('click', async e => {
   } catch (err) {
     showError('Download failed: ' + err.message);
   } finally {
+    processingEl.classList.remove('visible');
     downloadBtn.textContent = prev;
     downloadBtn.style.pointerEvents = '';
   }
