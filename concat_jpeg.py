@@ -1646,11 +1646,6 @@ async function _thumbFromSource(src, maxPx) {
   return URL.createObjectURL(blob);
 }
 
-async function makeThumbnail(file, maxPx = 400) {
-  const bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' });
-  try { return await _thumbFromSource(bitmap, maxPx); }
-  finally { bitmap.close(); }
-}
 
 // Releases everything a cell owns (thumbnail URL, cached preview bitmap).
 // Call whenever a cell object is dropped from the grid or replaced.
@@ -1780,16 +1775,30 @@ function updateCellInPlace(r, c) {
   img.alt = cell.name;
 }
 
+// One full-resolution decode per added image yields both the grid
+// thumbnail and the (pre-warmed) live-preview bitmap, so the first slider
+// drag never stalls on a decode. Costs some memory up front, in exchange
+// for smoothness.
 async function makeCells(files) {
   const imgs = [...files].filter(f => f.type.startsWith('image/'));
-  const cells = await Promise.all(imgs.map(async f => ({
-    id: uid(), name: f.name, file: f, dataURL: await makeThumbnail(f),
-  })));
-  // Warm the live-preview bitmaps in the background so the first slider
-  // drag doesn't stall on full-resolution decodes. Costs a little memory
-  // and idle CPU right after adding images, in exchange for smoothness.
-  for (const cell of cells) _getBitmap(cell).catch(() => {});
-  return cells;
+  return Promise.all(imgs.map(async f => {
+    const full = await createImageBitmap(f, { imageOrientation: 'from-image' });
+    const cell = { id: uid(), name: f.name, file: f };
+    let entry;
+    try {
+      // Both start their synchronous draws from `full` before it is closed.
+      const thumbP = _thumbFromSource(full, 400);
+      entry = _previewEntryFrom(full);
+      cell.dataURL = await thumbP;
+    } catch (err) {
+      full.close();
+      if (entry) entry.then(e => e.bmp.close(), () => {});
+      throw err;
+    }
+    _bitmapCache[cell.id] = entry;
+    entry.catch(() => { if (_bitmapCache[cell.id] === entry) delete _bitmapCache[cell.id]; });
+    return cell;
+  }));
 }
 
 async function initFromFiles(files) {
@@ -2159,8 +2168,9 @@ function _renderZoomStrip({ cv, dw0, ov, cvW, cvH }) {
 // each rAF tick resamples a few megapixels instead of full camera frames.
 const LIVE_MAX_PX = 2000;
 
-async function _loadPreviewBitmap(file) {
-  const full = await createImageBitmap(file, { imageOrientation: 'from-image' });
+// Turns a full-resolution bitmap into a preview-cache entry, taking
+// ownership of `full` (closed here unless it is small enough to keep).
+async function _previewEntryFrom(full) {
   const w = full.width, h = full.height;
   const s = LIVE_MAX_PX / Math.max(w, h);
   if (s >= 1) return { bmp: full, w, h };
@@ -2175,6 +2185,10 @@ async function _loadPreviewBitmap(file) {
     c.drawImage(full, 0, 0, cv.width, cv.height);
     return { bmp: await createImageBitmap(cv), w, h };
   } finally { full.close(); }
+}
+
+async function _loadPreviewBitmap(file) {
+  return _previewEntryFrom(await createImageBitmap(file, { imageOrientation: 'from-image' }));
 }
 
 function _getBitmap(cell) {
@@ -2295,9 +2309,14 @@ async function updateLivePreview() {
     zoomPanel.style.display = 'none';
   }
 
+  _liveDrawCount++;
   _showPreview(previewLive, cvW >= cvH);
   statusEl.textContent = `${cells.length} images · ${overlap}px overlap`;
 }
+
+// Counts live-canvas paints. A server result whose <img> finishes decoding
+// after a newer live paint must not cover it.
+let _liveDrawCount = 0;
 
 // Bumped whenever the preview pane gets authoritative content (a server
 // result), invalidating any live composite still in flight.
@@ -2343,9 +2362,11 @@ stitchBtn.addEventListener('click', async () => {
     const blob = await res.blob();
     _lastServerResult = { ...sig, blob };
     _previewGen++;
+    const liveDrawsAtResult = _liveDrawCount;
     if (_previewObjectURL) URL.revokeObjectURL(_previewObjectURL);
     _previewObjectURL = URL.createObjectURL(blob);
     previewImg.onload = () => {
+      if (_liveDrawCount !== liveDrawsAtResult) return;  // user moved on
       _showPreview(previewImg, previewImg.naturalWidth >= previewImg.naturalHeight);
     };
     previewImg.src = _previewObjectURL;
