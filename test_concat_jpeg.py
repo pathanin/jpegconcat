@@ -676,7 +676,7 @@ class TestStitchGrid:
         path_a = self._save(tmpdir, "a.jpg", (100, 50), (255, 0, 0))
         path_b = self._save(tmpdir, "b.jpg", (100, 50), (0, 255, 0))
         paths = {"a": path_a, "b": path_b}
-        out, applied_overlap = cj._stitch_grid([["a", "b"]], paths, str(tmpdir), overlap=20)
+        out, applied_overlap = cj._stitch_grid([["a", "b"]], paths, overlap=20)
         assert out is not None
         assert applied_overlap == 20
         result = Image.open(out)
@@ -686,7 +686,7 @@ class TestStitchGrid:
         """Boundary: a 2x2 grid silently drops overlap (non-1D shape) instead of crashing,
         and reports the actually-applied overlap (0) rather than the requested one."""
         paths = {k: self._save(tmpdir, f"{k}.jpg", (40, 40), (10, 10, 10)) for k in "abcd"}
-        out, applied_overlap = cj._stitch_grid([["a", "b"], ["c", "d"]], paths, str(tmpdir), overlap=20)
+        out, applied_overlap = cj._stitch_grid([["a", "b"], ["c", "d"]], paths, overlap=20)
         assert out is not None
         assert applied_overlap == 0
         result = Image.open(out)
@@ -704,7 +704,7 @@ class TestStitchGrid:
         # exif_transpose is only called on the decode-from-disk path in
         # _stitch_grid; if preopened images are used it should never run.
         with patch.object(cj.ImageOps, "exif_transpose", side_effect=AssertionError("should not re-decode")) as mock_transpose:
-            out, _ = cj._stitch_grid([["a", "b"]], paths, str(tmpdir), overlap=0, preopened=preopened)
+            out, _ = cj._stitch_grid([["a", "b"]], paths, overlap=0, preopened=preopened)
         mock_transpose.assert_not_called()
         assert out is not None
 
@@ -903,3 +903,239 @@ class TestWebUIFiles:
     def test_download_is_a_keyboard_reachable_button(self):
         """An <a> without href can't take focus; Download must stay a button."""
         assert '<button id="download-btn"' in self._read("index.html")
+
+
+# ── Tests: metadata, shared encoder, size cap ─────────────────────────────────
+
+def _exif_bytes(make="TestCam", orientation=None):
+    ex = Image.Exif()
+    ex[0x010F] = make
+    if orientation:
+        ex[0x0112] = orientation
+    return ex.tobytes()
+
+
+def _srgb_icc():
+    from PIL import ImageCms
+    return ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+
+
+def _jpeg_buf(size, color, mode="RGB", **save_kw):
+    import io
+    buf = io.BytesIO()
+    Image.new(mode, size, color).save(buf, "JPEG", quality=90, **save_kw)
+    buf.seek(0)
+    return buf
+
+
+class TestMetadataCarryOver:
+    """The first image's EXIF and colour profile must reach the output on
+    every path: an iPhone photo without its P3 profile shifts colour."""
+
+    def _pair(self, tmpdir, first_size, second_size):
+        a = os.path.join(tmpdir, "a.jpg")
+        b = os.path.join(tmpdir, "b.jpg")
+        Image.new("RGB", first_size, (10, 200, 10)).save(
+            a, "JPEG", quality=90, exif=_exif_bytes(), icc_profile=_srgb_icc())
+        Image.new("RGB", second_size, (200, 10, 10)).save(b, "JPEG", quality=90)
+        return [a, b]
+
+    @pytest.mark.skipif(not __import__("shutil").which("jpegtran"), reason="jpegtran not installed")
+    def test_lossless_path_keeps_exif_and_icc(self, tmpdir, capsys):
+        paths = self._pair(tmpdir, (64, 64), (64, 64))
+        out = os.path.join(tmpdir, "out.jpg")
+        cj.concat_images(paths, out, direction="horizontal", order="as-given")
+        assert "lossless" in capsys.readouterr().out
+        res = Image.open(out)
+        assert res.getexif().get(0x010F) == "TestCam"
+        assert res.info.get("icc_profile") == _srgb_icc()
+
+    def test_pillow_path_keeps_exif_and_icc(self, tmpdir, capsys):
+        paths = self._pair(tmpdir, (60, 64), (60, 64))  # 60 px: not MCU-aligned
+        out = os.path.join(tmpdir, "out.jpg")
+        cj.concat_images(paths, out, direction="horizontal", order="as-given")
+        assert "lossless" not in capsys.readouterr().out
+        res = Image.open(out)
+        assert res.getexif().get(0x010F) == "TestCam"
+        assert res.info.get("icc_profile") == _srgb_icc()
+
+    def test_copied_exif_drops_stale_pixel_dimensions(self, tmpdir):
+        ex = Image.Exif()
+        ex[0x010F] = "TestCam"
+        sub = ex.get_ifd(0x8769)
+        sub[0xA002], sub[0xA003] = 60, 64
+        a = os.path.join(tmpdir, "a.jpg")
+        b = os.path.join(tmpdir, "b.jpg")
+        Image.new("RGB", (60, 64)).save(a, "JPEG", exif=ex.tobytes())
+        Image.new("RGB", (60, 64)).save(b, "JPEG")
+        out = os.path.join(tmpdir, "out.jpg")
+        cj.concat_images([a, b], out, direction="horizontal", order="as-given")
+        res_ex = Image.open(out).getexif()
+        assert res_ex.get(0x010F) == "TestCam"
+        assert 0xA002 not in res_ex.get_ifd(0x8769)
+
+
+class TestOutputMode:
+    def test_grayscale_first_with_colour_second_stays_colour(self, tmpdir):
+        """Grayscale output only when every input is grayscale; otherwise the
+        colour images would lose their colour (and the preview shows colour)."""
+        a = os.path.join(tmpdir, "a.jpg")
+        b = os.path.join(tmpdir, "b.jpg")
+        Image.new("L", (40, 40), 128).save(a, "JPEG")
+        Image.new("RGB", (40, 40), (255, 0, 0)).save(b, "JPEG")
+        out = os.path.join(tmpdir, "out.jpg")
+        cj.concat_images([a, b], out, direction="horizontal", order="as-given")
+        res = Image.open(out)
+        assert res.mode == "RGB"
+        r, g, _ = res.getpixel((60, 20))
+        assert r > 200 and g < 60
+
+    def test_all_grayscale_stays_grayscale(self, tmpdir):
+        a = os.path.join(tmpdir, "a.jpg")
+        b = os.path.join(tmpdir, "b.jpg")
+        Image.new("L", (40, 40), 10).save(a, "JPEG")
+        Image.new("L", (40, 40), 240).save(b, "JPEG")
+        out, _ = cj._stitch_grid([["a", "b"]], {"a": a, "b": b})
+        assert Image.open(out).mode == "L"
+
+
+class TestCliOutputPath:
+    def test_auto_output_uses_make_output_path(self, tmpdir):
+        """Mixed input formats fall back to .jpg (the tested helper's rule)."""
+        a = os.path.join(tmpdir, "a.png")
+        b = os.path.join(tmpdir, "b.jpg")
+        Image.new("RGB", (20, 20)).save(a, "PNG")
+        Image.new("RGB", (20, 20)).save(b, "JPEG")
+        cj.concat_images([a, b], None, direction="horizontal", order="as-given")
+        assert os.path.exists(os.path.join(tmpdir, "concat.jpg"))
+
+
+class TestStitchGridContract:
+    def test_does_not_mutate_callers_layout(self, tmpdir):
+        a = os.path.join(tmpdir, "a.jpg")
+        Image.new("RGB", (20, 20)).save(a, "JPEG")
+        layout = [["a", "a"], ["a"]]
+        cj._stitch_grid(layout, {"a": a})
+        assert layout == [["a", "a"], ["a"]]
+
+    def test_oversize_raises_canvas_too_large(self, tmpdir):
+        a = os.path.join(tmpdir, "a.jpg")
+        Image.new("RGB", (60, 10)).save(a, "JPEG")
+        with pytest.raises(cj.CanvasTooLarge) as exc:
+            cj._stitch_grid([["a", "a", "a"]], {"a": a}, max_px=100)
+        assert "180" in str(exc.value) and "100" in str(exc.value)
+
+
+@pytest.mark.skipif(not cj._HAS_FLASK, reason="Flask not installed")
+class TestWebStitchFixes:
+    def _post(self, layout, files, route="/stitch", **fields):
+        import json
+        data = {"layout": json.dumps(layout), "overlap": "0", **fields}
+        for fid, buf in files.items():
+            data[fid] = (buf, fid + ".jpg")
+        return cj._create_web_app().test_client().post(
+            route, data=data, content_type="multipart/form-data")
+
+    def test_oversize_row_is_413_with_plain_message(self):
+        res = self._post([["a", "b", "c", "d", "e"]],
+                         {k: _jpeg_buf((4032, 10), (0, 0, 0)) for k in "abcde"})
+        assert res.status_code == 413
+        assert res.mimetype == "text/plain"
+        assert "16384" in res.get_data(as_text=True)
+
+    def test_errors_are_plain_text(self):
+        res = self._post([], {})
+        assert res.status_code == 400
+        assert res.mimetype == "text/plain"
+        assert "<html" not in res.get_data(as_text=True).lower()
+
+    def test_unknown_overlap_blend_rejected(self):
+        res = self._post([["a", "b"]], {"a": _jpeg_buf((20, 20), 0), "b": _jpeg_buf((20, 20), 0)},
+                         overlap_blend="<script>")
+        assert res.status_code == 400
+
+    def test_non_string_ids_rejected(self):
+        res = self._post([[{"x": 1}, "b"]], {"b": _jpeg_buf((20, 20), 0)})
+        assert res.status_code == 400
+
+    def test_keeps_first_images_exif_and_icc(self):
+        import io
+        a = _jpeg_buf((20, 20), (0, 200, 0), exif=_exif_bytes(), icc_profile=_srgb_icc())
+        res = self._post([["a", "b"]], {"a": a, "b": _jpeg_buf((20, 20), 0)})
+        out = Image.open(io.BytesIO(res.data))
+        assert out.getexif().get(0x010F) == "TestCam"
+        assert out.info.get("icc_profile") == _srgb_icc()
+
+    def test_grayscale_first_cell_keeps_colour(self):
+        import io
+        res = self._post([["a", "b"]], {"a": _jpeg_buf((20, 20), 128, mode="L"),
+                                        "b": _jpeg_buf((20, 20), (255, 0, 0))})
+        assert Image.open(io.BytesIO(res.data)).mode == "RGB"
+
+    def test_transforms_applied_on_server_from_original_bytes(self):
+        """Rotate/flip arrive as instructions; the server applies them to the
+        original upload, so the output keeps the source's quantization tables."""
+        import io, json
+        src = Image.new("RGB", (40, 20), (0, 0, 255))
+        src.paste((255, 255, 0), (0, 0, 20, 20))  # left half yellow
+        a = io.BytesIO()
+        src.save(a, "JPEG", quality=60)
+        qt_src = Image.open(io.BytesIO(a.getvalue())).quantization
+        a.seek(0)
+        res = self._post([["a"], ["b"]], {"a": a, "b": _jpeg_buf((20, 40), 0)},
+                         transforms=json.dumps({"a": {"rot": 1, "flip": False}}))
+        assert res.status_code == 200
+        out = Image.open(io.BytesIO(res.data))
+        assert out.quantization == qt_src
+        rgb = out.convert("RGB")
+        assert rgb.size == (20, 80)
+        # Clockwise: the yellow left half becomes the top half
+        assert rgb.getpixel((10, 5))[2] < 80
+        assert rgb.getpixel((10, 35))[2] > 180
+
+    def test_flip_then_rotate_matches_client_order(self):
+        """{flip, rot} means: mirror left-right first, then rotate clockwise."""
+        import io, json
+        src = Image.new("RGB", (40, 20), (0, 0, 255))
+        src.paste((255, 255, 0), (0, 0, 20, 20))  # left half yellow
+        a = io.BytesIO()
+        src.save(a, "JPEG", quality=95)
+        a.seek(0)
+        res = self._post([["a"]], {"a": a}, transforms=json.dumps({"a": {"rot": 1, "flip": True}}))
+        rgb = Image.open(io.BytesIO(res.data)).convert("RGB")
+        # Flip puts yellow on the right; rotating clockwise moves it to the bottom
+        assert rgb.getpixel((10, 35))[2] < 80
+        assert rgb.getpixel((10, 5))[2] > 180
+
+    def test_bad_transform_rejected(self):
+        import json
+        res = self._post([["a"]], {"a": _jpeg_buf((20, 20), 0)},
+                         transforms=json.dumps({"a": {"rot": 7, "flip": False}}))
+        assert res.status_code == 400
+
+
+class TestCliEdges:
+    def _pair(self, tmpdir, size=(64, 64)):
+        paths = []
+        for n in "ab":
+            p = os.path.join(tmpdir, f"{n}.jpg")
+            Image.new("RGB", size, (90, 90, 90)).save(p, "JPEG")
+            paths.append(p)
+        return paths
+
+    def test_oversize_output_exits_with_message(self, tmpdir, capsys):
+        a, b = self._pair(tmpdir, size=(60, 64))
+        out = os.path.join(tmpdir, "out.jpg")
+        with patch.object(cj, "_JPEG_MAX_PX", 100), \
+             patch.object(sys, "argv", ["prog", a, b, "-o", out, "-d", "h"]):
+            with pytest.raises(SystemExit):
+                cj.main()
+        assert "limit is 100 px" in capsys.readouterr().err
+
+    def test_png_output_from_aligned_jpegs_is_png(self, tmpdir):
+        """MCU-aligned JPEG inputs must not take the jpegtran path when the
+        output is .png — that would write JPEG bytes under a .png name."""
+        a, b = self._pair(tmpdir)
+        out = os.path.join(tmpdir, "out.png")
+        cj.concat_images([a, b], out, direction="horizontal", order="as-given")
+        assert Image.open(out).format == "PNG"

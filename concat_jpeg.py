@@ -8,14 +8,15 @@ Usage:
                            [--order auto|as-given]
 
 Auto-detection (both on by default):
-  order:     for 2 images, uses edge-color seam matching; otherwise sorts by
-             embedded numeric sequence in filename, then EXIF timestamp, then mtime
-  direction: for 2 images, determined by edge-color seam matching; otherwise
-             portrait → horizontal, landscape → vertical
+  order:     for 2 images (with numpy), the image with more content on its inner
+             side goes first, unless one seam scores ≥5× better (a panorama);
+             otherwise sorts by embedded numeric sequence in filename, then EXIF
+             timestamp, then mtime
+  direction: portrait-majority → horizontal, otherwise vertical
 
-Note: The lossless jpegtran fast-path uses -copy all to preserve metadata from
-the first source image (EXIF, ICC profiles, XMP). The Pillow fallback also
-preserves EXIF from the first source image.
+Metadata: every output path (jpegtran, Pillow, web UI) carries the first
+image's EXIF (orientation reset, stale pixel dimensions dropped) and its ICC
+colour profile. Metadata from the other images is discarded.
 """
 
 import argparse
@@ -144,7 +145,7 @@ def _jpeg_params_from_bytes(raw):
         subsampling = _parse_sof_subsampling(raw)
         _img = Image.open(io.BytesIO(raw))
         is_grayscale = (_img.mode == "L")
-        if _img.quantization:
+        if getattr(_img, "quantization", None):
             qtables = _img.quantization
             tbl = qtables.get(0, [])
             if len(tbl) == 64:
@@ -157,26 +158,54 @@ def _jpeg_params_from_bytes(raw):
     return qtables, quality, subsampling, is_grayscale
 
 
-def _jpeg_params_from_image(img):
-    """Extract JPEG params from an already-opened PIL Image (avoids re-reading disk).
+def _source_meta(raw):
+    """Return (exif, icc) from image bytes, ready to copy into the output.
 
-    For JPEG images, still does a binary read for SOF subsampling since Pillow
-    doesn't expose it cleanly. For non-JPEG, returns defaults.
+    EXIF orientation is reset to 1 because pixels are decoded upright, and the
+    pixel-dimension tags are dropped because they describe the source, not
+    the composite. Either value is None when absent.
     """
-    qtables = None
-    quality = 85
-    subsampling = 2
-    is_grayscale = (img.mode == "L")
+    try:
+        head = Image.open(io.BytesIO(raw))
+    except Exception:
+        return None, None
+    icc = head.info.get("icc_profile") or None
+    exif = head.info.get("exif") or None
+    if exif:
+        ex = Image.Exif()  # fresh copy: getexif() is cached on the image
+        ex.load(exif)
+        if ex.get(0x0112, 1) != 1:
+            ex[0x0112] = 1
+        sub = ex.get_ifd(0x8769)
+        sub.pop(0xA002, None)  # PixelXDimension
+        sub.pop(0xA003, None)  # PixelYDimension
+        exif = ex.tobytes()
+    return exif, icc
 
-    if img.format == "JPEG" and img.quantization:
-        qtables = img.quantization
-        tbl = qtables.get(0, [])
-        if len(tbl) == 64:
-            s = sum(tbl[k] * 100 / _STD_LUMA[k] for k in range(64)) / 64
-            q = (200 - s) / 2 if s <= 100 else 5000 / s
-            quality = max(1, min(95, round(q)))
 
-    return qtables, quality, subsampling, is_grayscale
+def _save_jpeg(canvas, dest, params, grayscale, exif=None, icc=None):
+    """Encode canvas as JPEG with the source's encoding params.
+
+    params    — (qtables, quality, subsampling, is_grayscale) of the source
+                whose encoding the output copies (the first image).
+    grayscale — whether the output is grayscale (all inputs were).
+    """
+    qtables, quality, subsampling, src_grayscale = params
+    kw = {}
+    if exif:
+        kw["exif"] = exif
+    # A profile only describes output of the same colour model as its source.
+    if icc and src_grayscale == grayscale:
+        kw["icc_profile"] = icc
+    if grayscale:
+        canvas = canvas.convert("L")
+    else:
+        kw["subsampling"] = subsampling
+    if qtables:
+        kw["qtables"] = qtables
+    else:
+        kw["quality"] = quality
+    canvas.save(dest, "JPEG", **kw)
 
 
 def _decode_rgb(raw):
@@ -210,16 +239,16 @@ def _decode_many(raws):
 
 # ── jpegtran lossless fast-path ───────────────────────────────────────────────
 
-def _try_lossless(image_paths, images, input_formats, output_path, direction, qtables, subsampling, all_subsampling=None):
+def _try_lossless(image_paths, images, input_formats, output_path, direction, qtables, subsampling,
+                  all_subsampling=None, exif=None, icc=None):
     """
     Attempt lossless DCT-level concatenation via jpegtran -drop.
 
     Returns True on success, False if any precondition is unmet.
 
-    NOTE: jpegtran is called with -copy all, so metadata (EXIF, ICC
-    profiles, XMP) from the first source image is preserved in the output.
-    Metadata from subsequent source images is discarded, which is expected
-    for a composite.
+    Metadata: jpegtran -copy all copies markers from its *input* file, which
+    is the blank canvas here, never the dropped images. So `exif` and `icc`
+    (the first image's) are written into that canvas and carried through.
 
     Preconditions:
       - jpegtran (libjpeg-turbo >= 1.4) is in PATH
@@ -270,17 +299,17 @@ def _try_lossless(image_paths, images, input_formats, output_path, direction, qt
 
     canvas_buf = io.BytesIO()
     blank = Image.new("RGB", canvas_size, (0, 0, 0))
+    meta_kw = {k: v for k, v in (("exif", exif), ("icc_profile", icc)) if v}
     if qtables:
-        blank.save(canvas_buf, "JPEG", qtables=qtables, subsampling=subsampling)
+        blank.save(canvas_buf, "JPEG", qtables=qtables, subsampling=subsampling, **meta_kw)
     else:
-        blank.save(canvas_buf, "JPEG", quality=85, subsampling=subsampling)
+        blank.save(canvas_buf, "JPEG", quality=85, subsampling=subsampling, **meta_kw)
     current = canvas_buf.getvalue()
     del blank, canvas_buf
 
     # Drop each source image into the canvas at its offset (DCT-level, no
     # re-encode). The growing canvas is piped through stdin/stdout rather
-    # than staged in temp files.
-    # -copy all: metadata from the first source image is preserved
+    # than staged in temp files. -copy all keeps the canvas's metadata.
     x = y = 0
     for path, img in zip(image_paths, images):
         result = subprocess.run(
@@ -487,6 +516,12 @@ def _visual_balance(img, direction):
         return float(arr[mid:, :].mean() - arr[:mid, :].mean())
 
 
+def _orientation_direction(images):
+    """Portrait-majority → horizontal (side by side), otherwise vertical."""
+    portrait_count = sum(1 for img in images if img.height >= img.width)
+    return "horizontal" if portrait_count * 2 >= len(images) else "vertical"
+
+
 def find_best_arrangement_2(paths, images, preserve_order, fix_direction):
     """
     For 2 images, determine direction and order.
@@ -504,12 +539,7 @@ def find_best_arrangement_2(paths, images, preserve_order, fix_direction):
     preserve_order=True  → skip order, only determine direction
     fix_direction=str    → use that direction instead of orientation heuristic
     """
-    # Direction from orientation heuristic (same logic as the 3+-image fallback)
-    if fix_direction:
-        direction = fix_direction
-    else:
-        portrait_count = sum(1 for img in images if img.height >= img.width)
-        direction = "horizontal" if portrait_count * 2 >= len(images) else "vertical"
+    direction = fix_direction or _orientation_direction(images)
     print(f"Direction: orientation heuristic → {direction}")
 
     if preserve_order:
@@ -573,6 +603,7 @@ def concat_images(image_paths, output_path=None, direction="auto", order="auto",
     """Concatenate images preserving source encoding parameters.
 
     output_path may be None — the path is auto-generated next to the first input.
+    Raises CanvasTooLarge if the result exceeds what a JPEG can hold.
     """
     # Read every input exactly once; headers, encoding params and pixels all
     # come from these bytes.
@@ -582,31 +613,12 @@ def concat_images(image_paths, output_path=None, direction="auto", order="auto",
             raws.append(f.read())
     raw_of = dict(zip(image_paths, raws))
     heads = [Image.open(io.BytesIO(r)) for r in raws]  # header-only, no pixel decode
-
-    _first = heads[0]
-    _first_format = _first.format
-    _first_exif = _first.info.get('exif') if _first_format == "JPEG" else None
-    if _first_exif and _first.getexif().get(0x0112, 1) != 1:
-        # Pixels get exif_transpose'd below, so the copied EXIF must not ask
-        # viewers to rotate them a second time.
-        _ex = Image.Exif()  # fresh copy: getexif() is cached on the image
-        _ex.load(_first_exif)
-        _ex[0x0112] = 1
-        _first_exif = _ex.tobytes()
+    head_of = dict(zip(image_paths, heads))
 
     if output_path is None:
-        fmt = _first.format or "JPEG"
-        out_dir = os.path.dirname(os.path.abspath(image_paths[0]))
-        ext = _FORMAT_TO_EXT.get(fmt, ".jpg")
-        stem = "concat"
-        candidate = os.path.join(out_dir, f"{stem}{ext}")
-        n = 2
-        while os.path.exists(candidate):
-            candidate = os.path.join(out_dir, f"{stem}_{n}{ext}")
-            n += 1
-        output_path = candidate
+        output_path = _make_output_path(image_paths, heads)
+    jpeg_out = os.path.splitext(output_path)[1].lower() in (".jpg", ".jpeg")
 
-    input_formats = [h.format for h in heads]
     # jpegtran -drop works on the stored (unrotated, unresized) DCT data, so
     # the lossless path is only valid when the decoded pixels match the file.
     pixels_differ_from_file = any(h.getexif().get(0x0112, 1) != 1 for h in heads)
@@ -622,8 +634,8 @@ def concat_images(image_paths, output_path=None, direction="auto", order="auto",
 
     # Ordering, direction and the lossless path only need dimensions, so
     # full-resolution decoding is deferred until pixels are actually needed
-    # (seam matching, a --fit resize, or the Pillow re-encode). Header
-    # dimensions equal decoded ones only when no EXIF rotation applies.
+    # (seam matching or the Pillow re-encode). Header dimensions equal decoded
+    # ones only when no EXIF rotation applies.
     decoded = use_edge_match or pixels_differ_from_file
     images = _decode_many(raws) if decoded else heads
 
@@ -644,8 +656,7 @@ def concat_images(image_paths, output_path=None, direction="auto", order="auto",
                     print(f"  {os.path.basename(p)}")
 
         if fix_direction is None:
-            portrait_count = sum(1 for img in images if img.height >= img.width)
-            direction = "horizontal" if portrait_count * 2 >= len(images) else "vertical"
+            direction = _orientation_direction(images)
             print(f"Direction: auto (orientation heuristic) → {direction}")
         else:
             direction = fix_direction
@@ -654,101 +665,46 @@ def concat_images(image_paths, output_path=None, direction="auto", order="auto",
             print("(install numpy for edge-color seam matching)")
 
     print(f"\nLayout: {direction}")
+    horizontal = direction == "horizontal"
 
     if fit:
-        pre_fit_sizes = [img.size for img in images]
-        if direction == "horizontal":
-            needs_resize = len({img.height for img in images}) > 1
-        else:
-            needs_resize = len({img.width for img in images}) > 1
-        if needs_resize and not decoded:
-            images = _decode_many([raw_of[p] for p in image_paths])
-            decoded = True
-        if direction == "horizontal":
-            target_h = max(img.height for img in images)
-            images = [
-                img.resize((round(img.width * target_h / img.height), target_h), Image.LANCZOS)
-                if img.height != target_h else img
-                for img in images
-            ]
-        else:
-            target_w = max(img.width for img in images)
-            images = [
-                img.resize((target_w, round(img.height * target_w / img.width)), Image.LANCZOS)
-                if img.width != target_w else img
-                for img in images
-            ]
-        print(f"Fit: resized images to share {'height' if direction == 'horizontal' else 'width'}")
-        if [img.size for img in images] != pre_fit_sizes:
+        # The compositor does the resizing; here it only rules out jpegtran.
+        if len({img.height if horizontal else img.width for img in images}) > 1:
             pixels_differ_from_file = True
+        print(f"Fit: resized images to share {'height' if horizontal else 'width'}")
 
-    # Detect encoding params from the first input image
-    first = image_paths[0]
-    qtables = quality = subsampling = None
-    is_grayscale = False
-    if input_formats[0] == "JPEG":
-        qtables, quality, subsampling, is_grayscale = _jpeg_params_from_bytes(raw_of[first])
-    else:
-        qtables, quality, subsampling = None, 85, 2
-
-    all_subsampling = None
-    if len(image_paths) > 1 and input_formats[0] == "JPEG":
-        all_subsampling = [subsampling]
-        for i in range(1, len(image_paths)):
-            if input_formats[i] == "JPEG":
-                all_subsampling.append(_parse_sof_subsampling(raw_of[image_paths[i]]))
-            else:
-                all_subsampling.append(2)
-
-    if overlap > 0:
-        min_join_dim = (min(img.width for img in images) if direction == "horizontal"
-                        else min(img.height for img in images))
-        if overlap >= min_join_dim:
-            overlap = max(0, min_join_dim - 1)
-            print(f"Warning: overlap clamped to {overlap}px")
+    # Encoding params and metadata come from the first image (in final order).
+    first_raw = raw_of[image_paths[0]]
+    params = _jpeg_params_from_bytes(first_raw)
+    qtables, quality, subsampling, _ = params
+    exif, icc = _source_meta(first_raw)
+    grayscale = all(head_of[p].mode == "L" for p in image_paths)
 
     if overlap > 0:
         print("Note: overlap disables the lossless jpegtran fast-path; re-encoding via Pillow.")
-    lossless = overlap == 0 and not pixels_differ_from_file and _try_lossless(image_paths, images, input_formats, output_path, direction, qtables, subsampling, all_subsampling=all_subsampling)
+    lossless = (
+        jpeg_out and overlap == 0 and not pixels_differ_from_file
+        and _try_lossless(
+            image_paths, images, [head_of[p].format for p in image_paths], output_path,
+            direction, qtables, subsampling,
+            all_subsampling=[_parse_sof_subsampling(raw_of[p]) for p in image_paths],
+            exif=exif, icc=None if params[3] else icc,  # the canvas is always colour
+        )
+    )
 
     # ── Pillow re-encode fallback ─────────────────────────────────────────────
     if not lossless:
         if not decoded:
             images = _decode_many([raw_of[p] for p in image_paths])
-        if direction == "horizontal":
-            total_w = sum(img.width  for img in images) - overlap * (len(images) - 1)
-            total_h = max(img.height for img in images)
-            canvas  = Image.new("RGB", (total_w, total_h), (0, 0, 0))
-            x = 0
-            for i, img in enumerate(images):
-                if i > 0 and overlap > 0:
-                    x -= overlap
-                _paste_overlap(canvas, img, (x, 0), overlap if i > 0 else 0, overlap_blend, "horizontal")
-                x += img.width
-        else:
-            total_w = max(img.width  for img in images)
-            total_h = sum(img.height for img in images) - overlap * (len(images) - 1)
-            canvas  = Image.new("RGB", (total_w, total_h), (0, 0, 0))
-            y = 0
-            for i, img in enumerate(images):
-                if i > 0 and overlap > 0:
-                    y -= overlap
-                _paste_overlap(canvas, img, (0, y), overlap if i > 0 else 0, overlap_blend, "vertical")
-                y += img.height
-
-        out_ext = os.path.splitext(output_path)[1].lower()
-        if out_ext in (".jpg", ".jpeg"):
-            # Preserve EXIF from the first source image (in the final arrangement)
-            exif_data = _first_exif
-
-            save_kwargs = {"exif": exif_data} if exif_data else {}
-            if is_grayscale:
-                canvas = canvas.convert("L")
-                canvas.save(output_path, "JPEG", qtables=qtables, **save_kwargs)
-            elif qtables:
-                canvas.save(output_path, "JPEG", qtables=qtables, subsampling=subsampling, **save_kwargs)
-            else:
-                canvas.save(output_path, "JPEG", quality=quality, subsampling=subsampling, **save_kwargs)
+        grid = [images] if horizontal else [[img] for img in images]
+        canvas, applied = _composite_grid(
+            grid, fit=fit, overlap=overlap, overlap_blend=overlap_blend,
+            max_px=_JPEG_MAX_PX if jpeg_out else None,
+        )
+        if applied < overlap:
+            print(f"Warning: overlap clamped to {applied}px")
+        if jpeg_out:
+            _save_jpeg(canvas, output_path, params, grayscale, exif, icc)
         else:
             canvas.save(output_path)
 
@@ -764,216 +720,203 @@ def concat_images(image_paths, output_path=None, direction="auto", order="auto",
     print(f"  Combined input:  {combined    // 1024} KB")
     print(f"  Output:          {output_size // 1024} KB  ({output_size / combined:.2f}x)")
 
-    out_ext = os.path.splitext(output_path)[1].lower()
-    if out_ext in (".jpg", ".jpeg"):
+    if jpeg_out:
         if lossless:
             enc = "lossless (jpegtran DCT)"
         elif qtables:
             enc = f"quality≈{quality} (exact source tables)"
         else:
             enc = f"quality={quality}"
-        if is_grayscale:
+        if grayscale and not lossless:
             ss_label = "grayscale"
         else:
             ss_label = ['4:4:4', '4:2:2', '4:2:0'][subsampling]
         print(f"\nEncoding: {enc}, subsampling={ss_label}")
     else:
-        print(f"\nEncoding: {out_ext.lstrip('.')} (lossless)")
+        print(f"\nEncoding: {os.path.splitext(output_path)[1].lstrip('.').lower()} (lossless)")
     print(f"Saved: {output_path}")
 
 
+# ── Grid compositing (shared by the CLI and the web UI) ───────────────────────
 
-# ── Web UI ────────────────────────────────────────────────────────────────────
-
-# Embedded single-file frontend — served directly from memory, no files on disk.
-# The browser UI lives in web/ next to this file: index.html (markup),
-# style.css and app.js, served as-is by _create_web_app.
-_WEB_DIR = Path(__file__).resolve().parent / "web"
+MAX_CANVAS_PX = 16384  # web UI cap per side; app.js mirrors it
+_JPEG_MAX_PX = 65500   # what libjpeg can encode per side
 
 
-def _stitch_grid(layout, paths, td, fit=False, overlap=0, overlap_blend="hard", preopened=None, preopened_params=None):
+class CanvasTooLarge(ValueError):
+    """The composite would exceed the allowed size; the message says by how much."""
+
+
+def _composite_grid(grid, fit=False, overlap=0, overlap_blend="hard", max_px=None):
     """
-    Composite a 2D grid of images into a single JPEG.
-
-    layout     — 2D list of file IDs (strings) or None for empty cells
-    paths      — {id: absolute_path}; only read for ids missing from preopened
-    td         — unused (kept for signature compatibility; the output is
-                 produced in memory)
-    preopened  — optional {id: Image} of already-decoded (EXIF-transposed, RGB)
-                 images, used instead of re-opening from paths to avoid a
-                 second full-resolution decode (e.g. after auto-overlap
-                 suggestion already opened them).
-    preopened_params — optional {id: (qtables, quality, subsampling, is_grayscale)}
-                 precomputed via _jpeg_params_from_bytes while the caller
-                 already had the raw bytes in hand, so this function doesn't
-                 need to re-read the first cell's file from disk.
+    Paste a rectangular 2D list of RGB Images (None = empty cell) onto one canvas.
 
     Column widths = max image width per column.
     Row heights   = max image height per row.
-    Empty cells   = black fill.
-    Encoding params taken from the first non-None cell (top-left scan order).
+    Empty space   = black fill.
+    fit           — single row: scale every image to the tallest height;
+                    otherwise scale each image to its column's width.
+    overlap       — only for a single row or column; clamped to one less than
+                    the smallest join dimension, zeroed for other shapes.
 
-    Returns (output_buffer, applied_overlap) — output_buffer is a BytesIO
-    positioned at 0, or None if there was nothing to stitch. applied_overlap
-    reflects any clamping or non-1D zeroing this function did to the
-    requested overlap, so callers can report what was actually used rather
-    than what was asked for.
+    Returns (canvas, applied_overlap), or (None, 0) if there's nothing to draw.
+    Raises CanvasTooLarge when a side would exceed max_px (None = no cap).
     """
-    preopened = preopened or {}
-    preopened_params = preopened_params or {}
-    first_path = None
-    first_fid = None
-    num_rows = len(layout)
-    num_cols = max(len(r) for r in layout)
-    for row in layout:
-        while len(row) < num_cols:
-            row.append(None)
-
+    num_rows = len(grid)
+    num_cols = max((len(r) for r in grid), default=0)
     col_widths  = [0] * num_cols
     row_heights = [0] * num_rows
-    grid = []
-    for r, row in enumerate(layout):
-        grid_row = []
-        for c, fid in enumerate(row):
-            if fid and fid in paths:
-                img = preopened.get(fid)
-                if img is None:
-                    with open(paths[fid], "rb") as fh:
-                        img = _decode_rgb(fh.read())
-                if first_path is None:
-                    first_path = paths[fid]
-                    first_fid = fid
+    for r, row in enumerate(grid):
+        for c, img in enumerate(row):
+            if img is not None:
                 col_widths[c]  = max(col_widths[c],  img.width)
                 row_heights[r] = max(row_heights[r], img.height)
-                grid_row.append(img)
-            else:
-                grid_row.append(None)
-        grid.append(grid_row)
-
-    if first_path is None:
+    if not any(col_widths):
         return None, 0
 
-    # Compute fit's target dimensions up front (cheap arithmetic) so the
-    # oversize-canvas check below can reject requests before any LANCZOS
-    # resampling runs. The actual resize happens later, after that check.
-    fit_new_w = None  # per-column new width, horizontal fit only
-    fit_new_h = None  # per-cell new height matrix, vertical fit only
-    if fit:
-        if num_rows == 1:
-            # Single-row horizontal: scale each image to the tallest row height
-            target_h = row_heights[0]
-            fit_new_w = [0] * num_cols
-            for c, img in enumerate(grid[0]):
-                if img is not None:
-                    fit_new_w[c] = (
-                        round(img.width * target_h / img.height) if img.height != target_h else img.width
-                    )
-            col_widths = list(fit_new_w)
-        else:
-            # Vertical single-column or multi-row grid: scale each image to its column width
-            fit_new_h = [[None] * num_cols for _ in range(num_rows)]
-            new_row_heights = [0] * num_rows
-            for r, row in enumerate(grid):
-                for c, img in enumerate(row):
-                    if img is not None:
-                        target_w = col_widths[c]
-                        h = round(img.height * target_w / img.width) if img.width != target_w else img.height
-                        fit_new_h[r][c] = h
-                        new_row_heights[r] = max(new_row_heights[r], h)
-            row_heights = new_row_heights
-
-    # Clamp overlap to something sensible for 1D layouts
-    if overlap > 0:
-        if num_rows == 1 and num_cols > 1:
-            overlap = min(overlap, min(col_widths) - 1)
-        elif num_cols == 1 and num_rows > 1:
-            overlap = min(overlap, min(row_heights) - 1)
-        else:
-            overlap = 0  # non-1D grid: ignore overlap
-        overlap = max(0, overlap)
-
-    if overlap > 0 and num_rows == 1:
-        total_w = sum(col_widths) - overlap * (num_cols - 1)
-        total_h = row_heights[0] if row_heights else 0
-    elif overlap > 0 and num_cols == 1:
-        total_w = col_widths[0] if col_widths else 0
-        total_h = sum(row_heights) - overlap * (num_rows - 1)
-    else:
-        total_w = sum(col_widths)
-        total_h = sum(row_heights)
-
-    if total_w <= 0 or total_h <= 0:
-        return None, 0
-
-    MAX_CANVAS_PX = 16384
-    if total_w > MAX_CANVAS_PX or total_h > MAX_CANVAS_PX:
-        return None, 0
-
-    # Now that the request has cleared the oversize check, actually perform
-    # the fit resampling using the dimensions computed above.
+    # Compute fit's target sizes up front (cheap arithmetic) so the size cap
+    # below can reject a request before any LANCZOS resampling runs.
+    fit_size = {}  # (r, c) → new (w, h)
     if fit:
         if num_rows == 1:
             target_h = row_heights[0]
             for c, img in enumerate(grid[0]):
                 if img is not None and img.height != target_h:
-                    grid[0][c] = img.resize((fit_new_w[c], target_h), Image.LANCZOS)
+                    fit_size[0, c] = (round(img.width * target_h / img.height), target_h)
+                    col_widths[c] = fit_size[0, c][0]
         else:
+            new_row_heights = [0] * num_rows
             for r, row in enumerate(grid):
                 for c, img in enumerate(row):
-                    if img is not None and img.width != col_widths[c]:
-                        grid[r][c] = img.resize((col_widths[c], fit_new_h[r][c]), Image.LANCZOS)
+                    if img is None:
+                        continue
+                    h = img.height
+                    if img.width != col_widths[c]:
+                        h = round(img.height * col_widths[c] / img.width)
+                        fit_size[r, c] = (col_widths[c], h)
+                    new_row_heights[r] = max(new_row_heights[r], h)
+            row_heights = new_row_heights
+
+    horizontal_1d = num_rows == 1 and num_cols > 1
+    vertical_1d   = num_cols == 1 and num_rows > 1
+    if overlap > 0:
+        if horizontal_1d:
+            overlap = min(overlap, min(col_widths) - 1)
+        elif vertical_1d:
+            overlap = min(overlap, min(row_heights) - 1)
+        else:
+            overlap = 0
+        overlap = max(0, overlap)
+
+    total_w = sum(col_widths)  - (overlap * (num_cols - 1) if horizontal_1d else 0)
+    total_h = sum(row_heights) - (overlap * (num_rows - 1) if vertical_1d else 0)
+    if total_w <= 0 or total_h <= 0:
+        return None, 0
+    if max_px is not None and (total_w > max_px or total_h > max_px):
+        raise CanvasTooLarge(
+            f"Output would be {total_w} × {total_h} px; the limit is {max_px} px per side."
+        )
 
     canvas = Image.new("RGB", (total_w, total_h), (0, 0, 0))
-
-    if overlap > 0 and num_rows == 1:
+    y = 0
+    for r, row in enumerate(grid):
         x = 0
-        for c in range(num_cols):
-            img = grid[0][c]
-            if img is None:
-                x += col_widths[c]
-                continue
-            if c > 0:
+        for c, img in enumerate(row):
+            if img is not None:
+                if (r, c) in fit_size:
+                    img = img.resize(fit_size[r, c], Image.LANCZOS)
+                if horizontal_1d and c > 0:
+                    x -= overlap
+                    _paste_overlap(canvas, img, (x, y), overlap, overlap_blend, "horizontal")
+                elif vertical_1d and r > 0:
+                    y -= overlap
+                    _paste_overlap(canvas, img, (x, y), overlap, overlap_blend, "vertical")
+                else:
+                    canvas.paste(img, (x, y))
+            elif horizontal_1d and c > 0:
                 x -= overlap
-            _paste_overlap(canvas, img, (x, 0), overlap if c > 0 else 0, overlap_blend, "horizontal")
-            x += col_widths[c]
-    elif overlap > 0 and num_cols == 1:
-        y = 0
-        for r in range(num_rows):
-            img = grid[r][0]
-            if img is None:
-                y += row_heights[r]
-                continue
-            if r > 0:
+            elif vertical_1d and r > 0:
                 y -= overlap
-            _paste_overlap(canvas, img, (0, y), overlap if r > 0 else 0, overlap_blend, "vertical")
-            y += row_heights[r]
-    else:
-        y_off = 0
-        for r, row in enumerate(grid):
-            x_off = 0
-            for c, img in enumerate(row):
-                if img is not None:
-                    canvas.paste(img, (x_off, y_off))
-                x_off += col_widths[c]
-            y_off += row_heights[r]
+            x += col_widths[c]
+        y += row_heights[r]
+    return canvas, overlap
 
-    if first_fid in preopened_params:
-        qtables, quality, subsampling, is_grayscale = preopened_params[first_fid]
-    else:
-        qtables, quality, subsampling, is_grayscale = _jpeg_params(first_path)
 
+# ── Web UI ────────────────────────────────────────────────────────────────────
+
+# The browser UI lives in web/ next to this file: index.html (markup),
+# style.css and app.js, served as-is by _create_web_app.
+_WEB_DIR = Path(__file__).resolve().parent / "web"
+
+
+_TURN_CW = {1: Image.Transpose.ROTATE_270, 2: Image.Transpose.ROTATE_180, 3: Image.Transpose.ROTATE_90}
+
+
+def _apply_orientation(img, rot=0, flip=False):
+    """Mirror left-right if flip, then turn rot quarter turns clockwise (the
+    order app.js uses for its thumbnails and live preview)."""
+    if flip:
+        img = img.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+    if rot:
+        img = img.transpose(_TURN_CW[rot])
+    return img
+
+
+def _stitch_grid(layout, paths=None, fit=False, overlap=0, overlap_blend="hard",
+                 preopened=None, preopened_params=None, preopened_meta=None, max_px=MAX_CANVAS_PX):
+    """
+    Composite a 2D grid of images into a single JPEG (see _composite_grid for
+    the layout rules).
+
+    layout     — 2D list of file IDs (strings) or None for empty cells; not modified
+    paths      — {id: path}; read only for ids missing from the preopened dicts
+    preopened  — optional {id: Image} of already-decoded (upright, RGB) images
+    preopened_params — optional {id: _jpeg_params_from_bytes(raw)}
+    preopened_meta   — optional {id: _source_meta(raw)}
+
+    Encoding params, EXIF and ICC come from the first non-empty cell (row-major).
+    The output is grayscale only when every image is.
+
+    Returns (output_buffer, applied_overlap): a BytesIO positioned at 0, or
+    None if there was nothing to stitch. Raises CanvasTooLarge past max_px.
+    """
+    paths = paths or {}
+    images = dict(preopened or {})
+    params = dict(preopened_params or {})
+    meta = dict(preopened_meta or {})
+
+    def _load(fid):
+        """Fill in whatever the caller didn't preopen, from one disk read."""
+        raw = None
+        if fid in paths:
+            with open(paths[fid], "rb") as fh:
+                raw = fh.read()
+        if fid not in images and raw is not None:
+            images[fid] = _decode_rgb(raw)
+        params.setdefault(fid, _jpeg_params_from_bytes(raw) if raw else (None, 85, 2, False))
+        meta.setdefault(fid, _source_meta(raw) if raw else (None, None))
+
+    num_cols = max(len(r) for r in layout)
+    used = []
+    for row in layout:
+        for fid in row:
+            if fid is not None and fid not in used and (fid in images or fid in paths):
+                if fid not in images or fid not in params or fid not in meta:
+                    _load(fid)
+                used.append(fid)
+    if not used:
+        return None, 0
+
+    grid = [[images.get(fid) if fid is not None else None for fid in row] + [None] * (num_cols - len(row))
+            for row in layout]
+    canvas, overlap = _composite_grid(grid, fit, overlap, overlap_blend, max_px)
+    if canvas is None:
+        return None, 0
+
+    first = used[0]
+    grayscale = all(params[fid][3] for fid in used)
     output_buf = io.BytesIO()
-    if is_grayscale:
-        canvas = canvas.convert("L")
-        if qtables:
-            canvas.save(output_buf, "JPEG", qtables=qtables)
-        else:
-            canvas.save(output_buf, "JPEG", quality=quality)
-    elif qtables:
-        canvas.save(output_buf, "JPEG", qtables=qtables, subsampling=subsampling)
-    else:
-        canvas.save(output_buf, "JPEG", quality=quality, subsampling=subsampling)
-
+    _save_jpeg(canvas, output_buf, params[first], grayscale, *meta[first])
     output_buf.seek(0)
     return output_buf, overlap
 
@@ -986,6 +929,7 @@ def _create_web_app(on_quit=None):
     """
     import json as _json
     from flask import Flask, abort, request, send_file, send_from_directory
+    from werkzeug.exceptions import HTTPException
 
     app = Flask(__name__, static_folder=str(_WEB_DIR), static_url_path="/static")
     app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200 MB total upload limit
@@ -997,6 +941,11 @@ def _create_web_app(on_quit=None):
     @app.route("/")
     def index():
         return send_from_directory(_WEB_DIR, "index.html")
+
+    # Errors go back as plain text, which the UI shows as-is in its status line.
+    @app.errorhandler(HTTPException)
+    def _plain_error(e):
+        return e.description or e.name, e.code, {"Content-Type": "text/plain; charset=utf-8"}
 
     def _validate_layout():
         layout_raw = request.form.get("layout")
@@ -1011,28 +960,50 @@ def _create_web_app(on_quit=None):
             abort(400, "Invalid layout")
         if not layout:
             abort(400, "Empty layout")
+        if not all(c is None or isinstance(c, str) for row in layout for c in row):
+            abort(400, "Invalid layout")
         num_cols = max(len(r) for r in layout)
-        for row in layout:
-            while len(row) < num_cols:
-                row.append(None)
+        layout = [row + [None] * (num_cols - len(row)) for row in layout]
         non_empty = [c for c in range(num_cols) if any(r[c] is not None for r in layout)]
-        if not non_empty:
-            abort(400, "No images in layout")
         return [[row[c] for c in non_empty] for row in layout]
+
+    def _parse_transforms():
+        """{id: (rot, flip)} from the optional `transforms` field: mirror
+        left-right if flip, then rot quarter turns clockwise."""
+        raw = request.form.get("transforms")
+        if not raw:
+            return {}
+        try:
+            data = _json.loads(raw)
+            if not isinstance(data, dict):
+                raise ValueError
+            out = {}
+            for fid, t in data.items():
+                rot, flip = t.get("rot", 0), t.get("flip", False)
+                if type(rot) is not int or not 0 <= rot <= 3 or not isinstance(flip, bool):
+                    raise ValueError
+                out[fid] = (rot, flip)
+            return out
+        except (ValueError, AttributeError, _json.JSONDecodeError):
+            abort(400, "Invalid transforms")
 
     def _stitch_to_buf():
         layout = _validate_layout()
+        transforms = _parse_transforms()
         fit = request.form.get("fit", "false").lower() == "true"
         # Default "0" (no overlap) so callers that omit the field — anything
         # other than the bundled UI, which always sends it explicitly — get
         # plain concatenation rather than a silently auto-applied overlap.
         overlap_raw   = request.form.get("overlap", "0")
         overlap_blend = request.form.get("overlap_blend", "hard")
+        if overlap_blend not in ("hard", "fade"):
+            abort(400, "overlap_blend must be hard or fade")
 
         # Only uploads the layout actually references are read, and they stay
-        # in memory: no temp-file write + re-read round trip. Each one is
-        # decoded once (in parallel) and its JPEG encoding params are taken
-        # from the same bytes, so _stitch_grid never touches the disk.
+        # in memory. Each one is decoded once (in parallel); encoding params
+        # and metadata come from the same bytes, so _stitch_grid never touches
+        # the disk. Rotate/flip are applied here, to the original upload, so
+        # the output keeps the source's encoding.
         referenced = []
         for row in layout:
             for fid in row:
@@ -1043,14 +1014,14 @@ def _create_web_app(on_quit=None):
             decoded = _decode_many(raws)
         except Exception:
             abort(400, "Could not decode one of the images")
-        opened = dict(zip(referenced, decoded))
+        opened = {fid: _apply_orientation(img, *transforms.get(fid, (0, False)))
+                  for fid, img in zip(referenced, decoded)}
         opened_params = {fid: _jpeg_params_from_bytes(raw) for fid, raw in zip(referenced, raws)}
-        paths = {fid: request.files[fid].filename or fid for fid in referenced}
-        del raws
+        opened_meta = {fid: _source_meta(raw) for fid, raw in zip(referenced, raws)}
+        del raws, decoded
 
         if overlap_raw == "auto":
-            n_rows = len(layout)
-            direction = "horizontal" if n_rows == 1 else "vertical"
+            direction = "horizontal" if len(layout) == 1 else "vertical"
             imgs = [opened[fid] for row in layout for fid in row if fid in opened]
             overlap = _suggest_overlap(imgs, direction) if len(imgs) >= 2 else 0
         else:
@@ -1059,31 +1030,32 @@ def _create_web_app(on_quit=None):
             except (ValueError, TypeError):
                 overlap = 0
 
-        buf, overlap = _stitch_grid(
-            layout, paths, None, fit=fit, overlap=overlap, overlap_blend=overlap_blend,
-            preopened=opened, preopened_params=opened_params,
-        )
+        try:
+            buf, overlap = _stitch_grid(
+                layout, fit=fit, overlap=overlap, overlap_blend=overlap_blend,
+                preopened=opened, preopened_params=opened_params, preopened_meta=opened_meta,
+            )
+        except CanvasTooLarge as e:
+            abort(413, str(e))
         if buf is None:
-            abort(500, "Nothing to stitch")
+            abort(400, "No images in layout")
         return buf, overlap, overlap_blend
+
+    def _stitch_response(as_attachment):
+        buf, overlap, overlap_blend = _stitch_to_buf()
+        resp = send_file(buf, mimetype="image/jpeg", as_attachment=as_attachment,
+                         download_name="stitched.jpg")
+        resp.headers["X-Overlap-Px"]    = str(overlap)
+        resp.headers["X-Overlap-Blend"] = overlap_blend
+        return resp
 
     @app.route("/stitch", methods=["POST"])
     def stitch():
-        from flask import make_response
-        buf, overlap, overlap_blend = _stitch_to_buf()
-        resp = make_response(send_file(buf, mimetype="image/jpeg", as_attachment=True, download_name="stitched.jpg"))
-        resp.headers["X-Overlap-Px"]    = str(overlap)
-        resp.headers["X-Overlap-Blend"] = overlap_blend
-        return resp
+        return _stitch_response(as_attachment=True)
 
     @app.route("/preview", methods=["POST"])
     def preview():
-        from flask import make_response
-        buf, overlap, overlap_blend = _stitch_to_buf()
-        resp = make_response(send_file(buf, mimetype="image/jpeg", as_attachment=False))
-        resp.headers["X-Overlap-Px"]    = str(overlap)
-        resp.headers["X-Overlap-Blend"] = overlap_blend
-        return resp
+        return _stitch_response(as_attachment=False)
 
     @app.route("/quit", methods=["POST"])
     def quit_server():
@@ -1205,7 +1177,11 @@ def main():
         print("Error: --overlap must be >= 0", file=sys.stderr)
         sys.exit(1)
 
-    concat_images(args.images, args.output, direction, args.order, fit=args.fit, overlap=args.overlap, overlap_blend=args.overlap_blend)
+    try:
+        concat_images(args.images, args.output, direction, args.order, fit=args.fit, overlap=args.overlap, overlap_blend=args.overlap_blend)
+    except CanvasTooLarge as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
