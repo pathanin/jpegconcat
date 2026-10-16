@@ -791,6 +791,10 @@ class TestWebApp:
         assert res.status_code == 200
         assert b'id="quit-btn"' in res.data
 
+    def test_quit_closes_tab(self):
+        res = self._client().get("/")
+        assert b"window.close()" in res.data
+
     def test_quit_invokes_callback(self):
         calls = []
         res = self._client(on_quit=lambda: calls.append(1)).post(

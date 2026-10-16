@@ -2728,6 +2728,10 @@ quitBtn.addEventListener('click', async () => {
     }
   }
   stoppedEl.classList.add('visible');
+  // Browsers only honour this for tabs with a single history entry (as
+  // opened by webbrowser.open) or script-opened ones; otherwise it's a
+  // no-op and the "stopped" overlay above stays as the fallback.
+  window.close();
 });
 
 // Names the download after the first image, e.g. beach.jpg → beach_stitched.jpg.
