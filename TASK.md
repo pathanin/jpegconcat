@@ -10,7 +10,6 @@ This file is a brief for whoever works on the UI next. **Must hold** is the beha
 - **Stitching follows `_stitch_grid`.** Each row is as tall as its tallest image and each column as wide as its widest. Size mismatches are filled with black, unless Fit is on. Overlap only applies to single-row or single-column layouts. If the UI wants different behaviour, change `_stitch_grid` and its tests first, then the UI.
 - **Output keeps the source encoding.** The server re-encodes with the first image's quantization tables and subsampling. The browser never produces the final JPEG.
 - **Local only.** The server binds to 127.0.0.1, and `/quit` keeps its same-origin check.
-- **Usable without a mouse.** Every action can be reached by keyboard, with a visible focus ring.
 
 ## Current approach
 
@@ -29,13 +28,15 @@ This file is a brief for whoever works on the UI next. **Must hold** is the beha
   - Drag one cell onto another to swap or move it.
   - × removes a cell (with undo), and the grid then compacts.
   - Each cell can be rotated and flipped from its hover toolbar, or with R, Shift+R, H and V when focused.
+  - Rotate/flip never re-encode the file in the browser. Each cell keeps its original upload plus an orientation (`{rot, flip}`), sent as the `transforms` field; the server applies it with `_apply_orientation`. Thumbnails and the live preview draw the same orientation client-side.
 - **Preview.**
   - Single-row and single-column layouts get an instant client-side composite.
   - Other grids get a debounced server render.
   - Download reuses the last server render when nothing has changed since.
-- **Visual style.** Minimal, with a neutral palette and one blue accent; the details are in the project memory. This is the current look, not a constraint.
+  - Output is capped at 16384 px per side (`MAX_CANVAS_PX`, mirrored in `app.js`). The live preview warns when a layout is over it; the server answers 413 with a plain-text reason.
+  - Server errors are plain text, shown as-is in the status line.
+- **Visual style.** Minimal, with a neutral palette and one blue accent; the details are in the project memory. This is the current look, not a constraint. Colours are tokens in `:root` at the top of `style.css`.
 
 ## Open ideas
 
-- Move the hard-coded CSS colours into `:root` custom properties, so a restyle only touches one place.
 - Find a clearer way to fill grids whose image sizes differ, beyond suggesting Fit.

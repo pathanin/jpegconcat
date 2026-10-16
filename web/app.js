@@ -31,6 +31,7 @@ const overlapAutoBtn    = document.getElementById('overlap-auto-btn');
 const overlapDecBtn     = document.getElementById('overlap-dec-btn');
 const overlapIncBtn     = document.getElementById('overlap-inc-btn');
 const overlapFadeToggle = document.getElementById('overlap-fade-toggle');
+const fitToggle         = document.getElementById('fit-toggle');
 const zoomToggleBtn     = document.getElementById('zoom-toggle-btn');
 const zoomPanel         = document.getElementById('zoom-panel');
 const zoomCanvas        = document.getElementById('zoom-canvas');
@@ -76,7 +77,7 @@ overlapAutoBtn.addEventListener('click', async () => {
   }
 });
 
-document.getElementById('fit-toggle').addEventListener('change', () => onLayoutChanged());
+fitToggle.addEventListener('change', () => onLayoutChanged());
 
 function _stepOverlap(delta) {
   const v = Math.min(parseInt(overlapSlider.max), Math.max(0, parseInt(overlapSlider.value) + delta));
@@ -170,8 +171,59 @@ async function _thumbFromSource(src, maxPx) {
 // Call whenever a cell object is dropped from the grid or replaced.
 function _disposeCell(cell) {
   if (!cell) return;
+  cell.disposed = true;
   _evictBitmap(cell.id);
   if (cell.dataURL && cell.dataURL.startsWith('blob:')) URL.revokeObjectURL(cell.dataURL);
+}
+
+// A cell's rotate/flip, applied on top of the original file: mirror
+// left-right if `flip`, then `rot` quarter turns clockwise. The file itself
+// is never re-encoded; the server applies the same steps to the upload
+// (_apply_orientation), so the output keeps the source's encoding.
+const NO_TURN = Object.freeze({ rot: 0, flip: false });
+
+function _turn({ rot, flip }, type) {
+  if (type === 'rotate-cw')  return { rot: (rot + 1) % 4, flip };
+  if (type === 'rotate-ccw') return { rot: (rot + 3) % 4, flip };
+  // Mirroring after a turn equals mirroring first and turning the other way.
+  if (type === 'flip-h') return { rot: (4 - rot) % 4, flip: !flip };
+  if (type === 'flip-v') return { rot: (6 - rot) % 4, flip: !flip };  // flip-h, then 180°
+  return { rot, flip };
+}
+
+// Decodes a cell's file, upright and with its rotate/flip applied.
+async function _decodeCell(cell) {
+  const bmp = await createImageBitmap(cell.file, { imageOrientation: 'from-image' });
+  const { rot, flip } = cell.orient;
+  if (!rot && !flip) return bmp;
+  try {
+    const turned = rot % 2 === 1;
+    const cv = Object.assign(document.createElement('canvas'), {
+      width: turned ? bmp.height : bmp.width, height: turned ? bmp.width : bmp.height,
+    });
+    const ctx = cv.getContext('2d');
+    ctx.translate(cv.width / 2, cv.height / 2);
+    ctx.rotate(rot * Math.PI / 2);
+    if (flip) ctx.scale(-1, 1);
+    ctx.drawImage(bmp, -bmp.width / 2, -bmp.height / 2);
+    return await createImageBitmap(cv);
+  } finally { bmp.close(); }
+}
+
+// One full-resolution decode yields both the grid thumbnail and the
+// (pre-warmed) live-preview bitmap, so the first slider drag never stalls
+// on a decode. The preview entry is cached at once, so a live preview
+// that runs meanwhile shares this decode. Resolves to the thumbnail URL.
+function _decodeInto(cell) {
+  let thumbP;
+  const entry = _decodeCell(cell).then(full => {
+    // Both start their synchronous draws from `full` before it is closed.
+    thumbP = _thumbFromSource(full, 400);
+    return _previewEntryFrom(full);
+  });
+  _bitmapCache[cell.id] = entry;
+  entry.catch(() => { if (_bitmapCache[cell.id] === entry) delete _bitmapCache[cell.id]; });
+  return entry.then(() => thumbP);
 }
 
 const nRows     = () => grid.length;
@@ -274,42 +326,38 @@ function moveCellToZone(srcR, srcC, dstR, dstC, zone) {
   return false;
 }
 
-async function applyTransform(r, c, type) {
+// Updates the grid at once, so quick repeated presses all count; the new
+// thumbnail follows when its decode finishes.
+function applyTransform(r, c, type) {
   _finalizeUndo();  // undo snapshots hold cell objects this would replace
   const cell = grid[r][c];
   if (!cell) return;
-  const img = await createImageBitmap(cell.file, { imageOrientation: 'from-image' });
-  const rotate = type === 'rotate-cw' || type === 'rotate-ccw';
-  const canvas = document.createElement('canvas');
-  canvas.width  = rotate ? img.height : img.width;
-  canvas.height = rotate ? img.width  : img.height;
-  const ctx = canvas.getContext('2d');
-  ctx.save();
-  if      (type === 'rotate-cw')  { ctx.translate(canvas.width, 0);  ctx.rotate( Math.PI / 2); }
-  else if (type === 'rotate-ccw') { ctx.translate(0, canvas.height); ctx.rotate(-Math.PI / 2); }
-  else if (type === 'flip-h')     { ctx.translate(canvas.width, 0);  ctx.scale(-1,  1); }
-  else if (type === 'flip-v')     { ctx.translate(0, canvas.height); ctx.scale( 1, -1); }
-  ctx.drawImage(img, 0, 0);
-  ctx.restore();
-  img.close();
-  // The thumbnail comes straight from the transformed canvas rather than
-  // re-decoding the freshly encoded JPEG.
-  const [blob, thumbURL] = await Promise.all([
-    new Promise(res => canvas.toBlob(res, 'image/jpeg', 0.92)),
-    _thumbFromSource(canvas, 400),
-  ]);
-  const newFile = new File([blob], cell.name, { type: 'image/jpeg' });
-  // The grid may have changed while we were encoding; only patch if this
-  // cell is still where it was.
-  if (grid[r] && grid[r][c] === cell) {
-    _disposeCell(cell);
-    grid[r][c] = { ...cell, dataURL: thumbURL, file: newFile };
-  } else {
-    URL.revokeObjectURL(thumbURL);
-    return;
-  }
-  updateCellInPlace(r, c);
+  // A new id makes the request signature and the preview cache see the
+  // change. `next` shows the old thumbnail until its own is ready.
+  const next = { ...cell, id: uid(), orient: _turn(cell.orient, type) };
+  cell.retired = true;
+  _evictBitmap(cell.id);
+  grid[r][c] = next;
   onLayoutChanged();
+  _decodeInto(next).then(url => {
+    // Superseded by a later turn, or removed: this thumbnail isn't needed.
+    if (next.retired || next.disposed) { URL.revokeObjectURL(url); return; }
+    URL.revokeObjectURL(next.dataURL);
+    next.dataURL = url;
+    const pos = _posOf(next);
+    if (pos) updateCellInPlace(pos[0], pos[1]);
+  }, err => {
+    console.error(err);
+    if (!next.retired && !next.disposed) showError(`Couldn’t turn ${cell.name}`);
+  });
+}
+
+function _posOf(cell) {
+  for (let r = 0; r < grid.length; r++) {
+    const c = grid[r].indexOf(cell);
+    if (c !== -1) return [r, c];
+  }
+  return null;
 }
 
 // Patches a single cell's thumbnail <img> in place instead of tearing down
@@ -326,10 +374,6 @@ function updateCellInPlace(r, c) {
   img.alt = cell.name;
 }
 
-// One full-resolution decode per added image yields both the grid
-// thumbnail and the (pre-warmed) live-preview bitmap, so the first slider
-// drag never stalls on a decode. Costs some memory up front, in exchange
-// for smoothness.
 // Decodes the image files into cells, with a loading message while it
 // runs. Unreadable files are skipped and reported rather than failing the
 // whole batch.
@@ -359,21 +403,13 @@ async function makeCells(files) {
 }
 
 async function _makeCell(f) {
-  const full = await createImageBitmap(f, { imageOrientation: 'from-image' });
-  const cell = { id: uid(), name: f.name, file: f };
-  let entry;
+  const cell = { id: uid(), name: f.name, file: f, orient: NO_TURN };
   try {
-    // Both start their synchronous draws from `full` before it is closed.
-    const thumbP = _thumbFromSource(full, 400);
-    entry = _previewEntryFrom(full);
-    cell.dataURL = await thumbP;
+    cell.dataURL = await _decodeInto(cell);
   } catch (err) {
-    full.close();
-    if (entry) entry.then(e => e.bmp.close(), () => {});
+    _evictBitmap(cell.id);
     throw err;
   }
-  _bitmapCache[cell.id] = entry;
-  entry.catch(() => { if (_bitmapCache[cell.id] === entry) delete _bitmapCache[cell.id]; });
   return cell;
 }
 
@@ -787,18 +823,21 @@ function _buildFormData() {
   const formData = new FormData();
   const layoutIds = grid.map(row => row.map(cell => cell ? cell.id : null));
   formData.append('layout', JSON.stringify(layoutIds));
-  formData.append('fit', document.getElementById('fit-toggle').checked);
+  formData.append('fit', fitToggle.checked);
   formData.append('overlap', overlapSlider.value);
   formData.append('overlap_blend', overlapFadeToggle.checked ? 'fade' : 'hard');
   const seen = new Set();
+  const transforms = {};
   for (const row of grid) {
     for (const cell of row) {
       if (cell && !seen.has(cell.id)) {
         formData.append(cell.id, cell.file, cell.name);
+        if (cell.orient.rot || cell.orient.flip) transforms[cell.id] = cell.orient;
         seen.add(cell.id);
       }
     }
   }
+  formData.append('transforms', JSON.stringify(transforms));
   return formData;
 }
 
@@ -818,7 +857,7 @@ function _requestSignature() {
   }));
   const key = JSON.stringify([
     layoutIds,
-    document.getElementById('fit-toggle').checked,
+    fitToggle.checked,
     overlapSlider.value,
     overlapFadeToggle.checked,
   ]);
@@ -864,10 +903,11 @@ function _renderZoomStrip({ cv, dw0, ov, cvW, cvH }) {
 
   // Mark overlap left/right boundaries
   // Accent line on a white under-stroke so it reads on dark and light photos.
+  const accent = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() || '#0066cc';
   for (const natX of [seamL, dw0]) {
     const mx = (natX - srcX) * ZOOM;
     if (mx >= 0 && mx <= zc.width) {
-      for (const [style, w] of [['#ffffff', 4], ['#0066cc', 2]]) {
+      for (const [style, w] of [['#ffffff', 4], [accent, 2]]) {
         zctx.strokeStyle = style; zctx.lineWidth = w;
         zctx.beginPath(); zctx.moveTo(mx, 0); zctx.lineTo(mx, zc.height); zctx.stroke();
       }
@@ -881,6 +921,10 @@ function _renderZoomStrip({ cv, dw0, ov, cvW, cvH }) {
 // to that bound (plus the natural size, which the layout math needs) means
 // each rAF tick resamples a few megapixels instead of full camera frames.
 const LIVE_MAX_PX = 2000;
+
+// The server refuses output larger than this per side (MAX_CANVAS_PX in
+// concat_jpeg.py); the live preview warns before Download would fail.
+const MAX_CANVAS_PX = 16384;
 
 // Turns a full-resolution bitmap into a preview-cache entry, taking
 // ownership of `full` (closed here unless it is small enough to keep).
@@ -901,14 +945,10 @@ async function _previewEntryFrom(full) {
   } finally { full.close(); }
 }
 
-async function _loadPreviewBitmap(file) {
-  return _previewEntryFrom(await createImageBitmap(file, { imageOrientation: 'from-image' }));
-}
-
 function _getBitmap(cell) {
   // Cache the promise so concurrent callers share one decode.
   if (!_bitmapCache[cell.id]) {
-    const p = _loadPreviewBitmap(cell.file);
+    const p = _decodeCell(cell).then(_previewEntryFrom);
     _bitmapCache[cell.id] = p;
     p.catch(() => { if (_bitmapCache[cell.id] === p) delete _bitmapCache[cell.id]; });
   }
@@ -981,7 +1021,7 @@ async function updateLivePreview() {
 
   // Output size of each image. Mirrors _stitch_grid's fit: scale every
   // image to the tallest height (row) or widest width (column).
-  if (document.getElementById('fit-toggle').checked) {
+  if (fitToggle.checked) {
     const maxH = Math.max(...entries.map(e => e.h));
     const maxW = Math.max(...entries.map(e => e.w));
     entries = entries.map(e => horizontal
@@ -1046,9 +1086,12 @@ async function updateLivePreview() {
   _liveDrawCount++;
   _showPreview(previewLive, cvW >= cvH);
   const uneven = new Set(entries.map(e => horizontal ? e.h : e.w)).size > 1;
-  _setPreviewState('live', uneven
-    ? 'Quick preview · Sizes differ, so gaps save as black. Turn on Fit to fill them.'
-    : null);
+  const tooBig = natW > MAX_CANVAS_PX || natH > MAX_CANVAS_PX;
+  _setPreviewState('live', tooBig
+    ? `Too large to save: ${natW} × ${natH} px. The limit is ${MAX_CANVAS_PX} px per side.`
+    : uneven
+      ? 'Quick preview · Sizes differ, so gaps save as black. Turn on Fit to fill them.'
+      : null);
   updateStatus();
 }
 
@@ -1099,8 +1142,7 @@ async function runServerPreview() {
   try {
     const res = await fetch('/preview', { method: 'POST', body: _buildFormData() });
     if (!res.ok) {
-      const msg = await res.text().catch(() => res.statusText);
-      throw new Error(`Server error ${res.status}: ${msg}`);
+      throw new Error(await res.text().catch(() => res.statusText));
     }
     const blob = await res.blob();
     if (seq !== _serverPreviewSeq) return;
@@ -1198,7 +1240,7 @@ downloadBtn.addEventListener('click', async () => {
     } else {
       processingEl.classList.add('visible');
       const res = await fetch('/stitch', { method: 'POST', body: _buildFormData() });
-      if (!res.ok) throw new Error(res.statusText);
+      if (!res.ok) throw new Error(await res.text().catch(() => res.statusText));
       blob = await res.blob();
       _lastServerResult = { ...sig, blob };
     }
