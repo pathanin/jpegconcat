@@ -724,6 +724,23 @@ class TestMain:
             with patch.object(sys, "argv", ["prog", "--help"]):
                 cj.main()
 
+    def test_main_no_args_launches_web_ui(self):
+        """No images → web UI starts (no -w needed), honouring --port."""
+        with patch.object(cj, "_run_web_server") as run:
+            with patch.object(sys, "argv", ["prog"]):
+                cj.main()
+            run.assert_called_once_with(port=5001)
+            run.reset_mock()
+            with patch.object(sys, "argv", ["prog", "--port", "8080"]):
+                cj.main()
+            run.assert_called_once_with(port=8080)
+
+    def test_main_web_flag_still_works(self):
+        with patch.object(cj, "_run_web_server") as run:
+            with patch.object(sys, "argv", ["prog", "-w"]):
+                cj.main()
+            run.assert_called_once_with(port=5001)
+
     def test_main_success(self, tmpdir):
         """Happy path through main()."""
         a = Image.new("RGB", (10, 20), (255, 0, 0))

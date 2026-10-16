@@ -1605,7 +1605,7 @@ body.loading, body.loading * { cursor: progress !important; }
 
 <div id="stopped" role="status" aria-live="polite">
   <strong>Image Stitcher has stopped</strong>
-  <span>You can close this tab. Run <code>jpegconcat --web</code> to start it again.</span>
+  <span>You can close this tab. Run <code>jpegconcat</code> to start it again.</span>
 </div>
 
 <div id="processing">
@@ -3149,7 +3149,7 @@ def main():
         usage=(
             "%(prog)s img1.jpg img2.jpg [img3.jpg ...] [--output out.jpg]"
             " [--direction h|v|auto] [--order auto|as-given]\n"
-            "       %(prog)s --web [--port PORT]"
+            "       %(prog)s [--port PORT]   (no images: open the web UI)"
         ),
     )
     _DIR_ALIASES = {"h": "horizontal", "v": "vertical", "a": "auto"}
@@ -3170,17 +3170,14 @@ def main():
     parser.add_argument("--overlap-blend", choices=["hard", "fade"], default="hard",
                         help="Overlap blend mode: hard=direct paste (default), fade=cross-fade")
     parser.add_argument("--web",  "-w", action="store_true",
-                        help="Launch the drag-and-drop web UI in your browser")
+                        help="Launch the drag-and-drop web UI (default when no images are given)")
     parser.add_argument("--port",       type=int, default=5001,
                         help="Port for --web mode (default: 5001)")
     args = parser.parse_args()
 
-    if args.web:
+    if args.web or not args.images:
         _run_web_server(port=args.port)
         return
-
-    if not args.images:
-        parser.error("the following arguments are required: images  (or use --web for the browser UI)")
 
     direction = _DIR_ALIASES.get(args.direction, args.direction)
 

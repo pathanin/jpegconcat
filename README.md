@@ -5,7 +5,7 @@ so the output file size stays close to the sum of the inputs.
 For 2 images, it auto-detects the correct order and orientation by matching
 edge colors — no need to specify anything.
 
-Also ships a **drag-and-drop browser UI** — run `jpegconcat --web` to open it.
+Also ships a **drag-and-drop browser UI** — run `jpegconcat` with no arguments to open it.
 
 ---
 
@@ -36,7 +36,7 @@ python3 concat_jpeg.py photo1.jpg photo2.jpg
 ## Browser UI
 
 ```
-jpegconcat --web
+jpegconcat
 ```
 
 Opens a drag-and-drop interface at `http://localhost:5001`. Drop images anywhere
@@ -57,7 +57,7 @@ on the page to build a grid, then click **Stitch & Download**.
 **Custom port:**
 
 ```
-jpegconcat --web --port 8080
+jpegconcat --port 8080
 ```
 
 ---
