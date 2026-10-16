@@ -172,14 +172,23 @@ def _source_meta(raw):
     icc = head.info.get("icc_profile") or None
     exif = head.info.get("exif") or None
     if exif:
-        ex = Image.Exif()  # fresh copy: getexif() is cached on the image
-        ex.load(exif)
-        if ex.get(0x0112, 1) != 1:
-            ex[0x0112] = 1
-        sub = ex.get_ifd(0x8769)
-        sub.pop(0xA002, None)  # PixelXDimension
-        sub.pop(0xA003, None)  # PixelYDimension
-        exif = ex.tobytes()
+        try:
+            ex = Image.Exif()  # fresh copy: getexif() is cached on the image
+            ex.load(exif)
+            if ex.get(0x0112, 1) != 1:
+                ex[0x0112] = 1
+            sub = ex.get_ifd(0x8769)
+            sub.pop(0xA002, None)  # PixelXDimension
+            sub.pop(0xA003, None)  # PixelYDimension
+            exif = ex.tobytes()
+        except Exception:
+            # Unparseable EXIF must not fail the stitch. Raw bytes are only
+            # safe to copy when they don't ask viewers to rotate the pixels.
+            try:
+                upright = head.getexif().get(0x0112, 1) == 1
+            except Exception:
+                upright = False
+            exif = exif if upright else None
     return exif, icc
 
 

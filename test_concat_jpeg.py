@@ -1139,3 +1139,48 @@ class TestCliEdges:
         out = os.path.join(tmpdir, "out.png")
         cj.concat_images([a, b], out, direction="horizontal", order="as-given")
         assert Image.open(out).format == "PNG"
+
+
+class TestVerticalCompositing:
+    """The CLI's vertical layout runs through _composite_grid as a one-column grid."""
+
+    def _save(self, tmpdir, name, size, color):
+        p = os.path.join(tmpdir, name)
+        Image.new("RGB", size, color).save(p, "JPEG", quality=95)
+        return p
+
+    @pytest.mark.parametrize("blend", ["hard", "fade"])
+    def test_vertical_overlap(self, tmpdir, blend):
+        a = self._save(tmpdir, "a.jpg", (100, 100), (255, 0, 0))
+        b = self._save(tmpdir, "b.jpg", (100, 100), (0, 0, 255))
+        out = os.path.join(tmpdir, "out.jpg")
+        cj.concat_images([a, b], out, direction="vertical", order="as-given",
+                         overlap=20, overlap_blend=blend)
+        res = Image.open(out).convert("RGB")
+        assert res.size == (100, 180)
+        assert res.getpixel((50, 40))[0] > 200   # first image above the overlap
+        assert res.getpixel((50, 150))[2] > 200  # second image below it
+
+    def test_vertical_fit_scales_to_widest(self, tmpdir):
+        a = self._save(tmpdir, "a.jpg", (200, 100), (255, 0, 0))
+        b = self._save(tmpdir, "b.jpg", (100, 100), (0, 255, 0))
+        out = os.path.join(tmpdir, "out.jpg")
+        cj.concat_images([a, b], out, direction="vertical", order="as-given", fit=True)
+        res = Image.open(out).convert("RGB")
+        assert res.size == (200, 300)
+        r, g, _ = res.getpixel((180, 280))  # far corner of the scaled-up slot
+        assert g > 200 and r < 60
+
+
+class TestSourceMetaRobustness:
+    def test_unparseable_exif_does_not_fail(self):
+        raw = _jpeg_buf((20, 20), 0, exif=_exif_bytes()).getvalue()
+        with patch.object(cj.Image.Exif, "tobytes", side_effect=ValueError("bad")):
+            exif, _ = cj._source_meta(raw)
+        assert exif  # upright source: raw bytes kept
+
+    def test_unparseable_rotated_exif_is_dropped(self):
+        raw = _jpeg_buf((20, 20), 0, exif=_exif_bytes(orientation=6)).getvalue()
+        with patch.object(cj.Image.Exif, "tobytes", side_effect=ValueError("bad")):
+            exif, _ = cj._source_meta(raw)
+        assert exif is None

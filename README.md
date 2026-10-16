@@ -95,5 +95,6 @@ jpegconcat a.jpg b.jpg c.jpg
 
 ## What it prints
 
-The script shows edge seam scores (lower = better match) so you can
-see why it chose the order/direction it did, plus a size report.
+The script says how it chose the order and direction (orientation
+heuristic, visual balance or a panoramic seam match, or filename order),
+then prints a size report and the encoding it used.
