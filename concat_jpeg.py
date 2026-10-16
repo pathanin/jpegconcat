@@ -825,6 +825,28 @@ h1 {
   color: #1d1d1f;
 }
 
+.header-left {
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  min-width: 0;
+}
+
+.capsule {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 6px 12px;
+  background: #fafafc;
+  border: 1px solid #e0e0e0;
+  border-radius: 11px;
+}
+
+#overlap-control {
+  padding-left: 14px;
+  border-left: 1px solid #e0e0e0;
+}
+
 .header-right {
   display: flex;
   align-items: center;
@@ -1204,7 +1226,7 @@ body.loading, body.loading * { cursor: progress !important; }
 .cell:hover .btn-remove,
 .cell:focus-within .btn-remove { opacity: 1; }
 .cell:focus-visible { outline: 2px solid #0071e3; outline-offset: 2px; }
-.btn-remove:hover { background: #dc2626; color: #fff; }
+.btn-remove:hover { background: rgba(0,0,0,0.85); color: #fff; }
 
 .cell-toolbar {
   position: absolute;
@@ -1326,25 +1348,29 @@ body.loading, body.loading * { cursor: progress !important; }
   font-weight: 400;
   line-height: 1;
   background: transparent;
-  border: 1px solid #c0c0c0;
-  border-radius: 4px;
-  color: #555;
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  color: #1d1d1f;
   cursor: pointer;
-  transition: border-color 0.12s, color 0.12s;
+  transition: border-color 0.12s, color 0.12s, transform 0.08s;
   display: flex;
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
 }
 .overlap-step-btn:hover { border-color: #0066cc; color: #0066cc; }
-.overlap-step-btn:active { background: rgba(0,102,204,0.08); }
+.overlap-step-btn:active { transform: scale(0.95); }
+.overlap-step-btn.active { border-color: #0066cc; color: #0066cc; background: rgba(0,102,204,0.06); }
+.overlap-step-btn:focus-visible, #overlap-auto-btn:focus-visible, .zoom-level-btn:focus-visible {
+  outline: 2px solid #0071e3; outline-offset: 2px;
+}
 .zoom-level-btn {
   padding: 1px 5px;
   font-size: 11px;
-  border: 1px solid #c0c0c0;
-  border-radius: 3px;
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
   background: transparent;
-  color: #666;
+  color: #1d1d1f;
   cursor: pointer;
 }
 .zoom-level-btn.active { background: #0066cc; color: #fff; border-color: #0066cc; }
@@ -1355,9 +1381,9 @@ body.loading, body.loading * { cursor: progress !important; }
   font-family: inherit;
   font-weight: 400;
   background: transparent;
-  border: 1px solid #c0c0c0;
-  border-radius: 4px;
-  color: #555;
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  color: #1d1d1f;
   cursor: pointer;
   transition: border-color 0.12s, color 0.12s;
   line-height: 1;
@@ -1412,7 +1438,7 @@ body.loading, body.loading * { cursor: progress !important; }
   padding: 6px 14px;
   background: transparent;
   color: #1d1d1f;
-  border: 1px solid #c0c0c0;
+  border: 1px solid #e0e0e0;
   border-radius: 9999px;
   font-family: inherit;
   font-size: 14px;
@@ -1488,10 +1514,13 @@ body.loading, body.loading * { cursor: progress !important; }
 <body>
 
 <header>
-  <h1>Image Stitcher</h1>
+  <div class="header-left">
+    <h1>Image Stitcher</h1>
+    <span id="status" aria-live="polite">Drop images to start</span>
+  </div>
   <div class="header-right">
-    <span id="status">Drop images to start</span>
-    <label class="fit-toggle-label">
+    <div id="options" class="capsule" style="display:none">
+    <label class="fit-toggle-label" title="Scale images to the same height (row) or width (column)">
       <input type="checkbox" id="fit-toggle" class="fit-toggle-input">
       <span class="fit-toggle-switch"></span>
       <span>Fit images to layout</span>
@@ -1509,6 +1538,7 @@ body.loading, body.loading * { cursor: progress !important; }
         <span class="fit-toggle-switch"></span>
         <span>Fade</span>
       </label>
+    </div>
     </div>
     <button id="add-images-btn" class="ghost-btn" style="display:none" title="Add more images to the end">Add Images</button>
     <button id="stitch-btn" disabled title="Stitch at full quality (⌘↵)">Stitch &amp; Preview</button>
@@ -1598,6 +1628,7 @@ const addTopBtn     = document.getElementById('add-top-btn');
 const addBottomBtn  = document.getElementById('add-bottom-btn');
 const stitchBtn     = document.getElementById('stitch-btn');
 const addImagesBtn  = document.getElementById('add-images-btn');
+const optionsEl     = document.getElementById('options');
 const statusEl      = document.getElementById('status');
 const processingEl  = document.getElementById('processing');
 const previewImg    = document.getElementById('preview-img');
@@ -1986,6 +2017,7 @@ function render() {
     stitchBtn.disabled = true;
     overlapCtrl.style.display = 'none';
     addImagesBtn.style.display = 'none';
+    optionsEl.style.display = 'none';
     onLayoutChanged();
     return;
   }
@@ -2004,6 +2036,7 @@ function render() {
   const n = imgCount();
   stitchBtn.disabled = n < 2;
   addImagesBtn.style.display = '';
+  optionsEl.style.display = n >= 2 ? 'flex' : 'none';
   // Overlap only applies to single-row or single-column grids — _stitch_grid
   // silently zeroes it for any other shape, so don't show a control that
   // would have no effect.
