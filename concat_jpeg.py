@@ -1138,7 +1138,7 @@ body.loading, body.loading * { cursor: progress !important; }
 
 #grid {
   display: inline-grid;
-  place-items: center;
+  place-items: start;
   gap: 6px;
   background: transparent;
   padding: 6px;
@@ -1184,6 +1184,8 @@ body.loading, body.loading * { cursor: progress !important; }
   border-color: #0066cc;
   color: #0066cc;
 }
+
+.cell.empty { place-self: stretch; }
 
 .cell.empty.drag-over-empty {
   border-color: #0066cc;
@@ -2176,7 +2178,7 @@ function buildCell(cell, r, c) {
   el.setAttribute('aria-label',
     `${cell.name}, row ${r + 1}, column ${c + 1}. R to rotate, H or V to flip, Delete to remove.`);
   el.addEventListener('keydown', e => {
-    if (e.target !== el || e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.target !== el || e.metaKey || e.ctrlKey || e.altKey || e.repeat) return;
     const key = e.key.toLowerCase();
     const transform = key === 'r' ? (e.shiftKey ? 'rotate-ccw' : 'rotate-cw')
                     : key === 'h' ? 'flip-h' : key === 'v' ? 'flip-v' : null;

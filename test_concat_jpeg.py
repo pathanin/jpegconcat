@@ -900,3 +900,7 @@ class TestWebUIHtml:
         html = cj._WEB_UI_HTML
         assert re.search(r'id="overlap-slider"[^>]*value="0"', html)
         assert '<span id="overlap-val">0 px</span>' in html
+
+    def test_download_is_a_keyboard_reachable_button(self):
+        """An <a> without href can't take focus; Download must stay a button."""
+        assert '<button id="download-btn"' in cj._WEB_UI_HTML
