@@ -31,6 +31,8 @@ pip3 install Pillow numpy flask
 python3 concat_jpeg.py photo1.jpg photo2.jpg
 ```
 
+Keep the `web/` folder next to `concat_jpeg.py`; the browser UI is served from it.
+
 ---
 
 ## Browser UI
@@ -47,12 +49,15 @@ on the page to build a grid, then click **Download**.
 - Drop onto the **top or bottom edge** → inserts a new row
 - Drop onto the **center** of a cell → replaces that image
 - Drag one cell onto another → **swap** them
-- Click **×** on a cell → removes it (grid compacts automatically)
-- Click **+** on the right or bottom border → adds an empty column/row
+- Click **×** on a cell → removes it (grid compacts automatically; **⌘Z** undoes)
+- Click **+** on any edge of the grid → picks an image for a new column/row there
 
-**Per-image transforms (hover any cell):**
-- **↺ ↻** — rotate 90° counter-clockwise / clockwise
-- **↔ ↕** — flip horizontal / vertical
+**Per-image transforms (hover a cell, or focus it with Tab):**
+- **↺ ↻** or **Shift+R / R** — rotate 90° counter-clockwise / clockwise
+- **↔ ↕** or **H / V** — flip horizontal / vertical
+- **Delete** — remove the focused image
+
+**Other shortcuts:** **⌘O** add images · **⌘↵** download · **⌘Z** undo remove
 
 **Custom port:**
 
