@@ -116,7 +116,7 @@ class Jpegconcat < Formula
       end
     end
 
-    libexec.install "concat_jpeg.py"
+    libexec.install "concat_jpeg.py", "web"
 
     (bin/"jpegconcat").write <<~EOS
       #!/bin/bash
@@ -127,5 +127,6 @@ class Jpegconcat < Formula
 
   test do
     system bin/"jpegconcat", "--help"
+    assert_path_exists libexec/"web/index.html"
   end
 end

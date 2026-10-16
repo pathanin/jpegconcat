@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Image Stitcher</title>
+<link rel="stylesheet" href="static/style.css">
+</head>
+<body>
+
+<header>
+  <div class="header-left">
+    <h1>Image Stitcher</h1>
+    <span id="status" aria-live="polite">Drop images to start</span>
+  </div>
+  <div class="header-right">
+    <div id="options" class="capsule" style="display:none">
+    <label class="fit-toggle-label" title="Scale images to the same height (row) or width (column)">
+      <input type="checkbox" id="fit-toggle" class="fit-toggle-input">
+      <span class="fit-toggle-switch"></span>
+      <span>Fit images to layout</span>
+    </label>
+    <div id="overlap-control" style="display:none">
+      <label for="overlap-slider">Overlap</label>
+      <input type="range" id="overlap-slider" min="0" max="800" value="0" step="1">
+      <button id="overlap-dec-btn" class="overlap-step-btn" title="Decrease by 1px" aria-label="Decrease overlap by 1 pixel">−</button>
+      <span id="overlap-val">0 px</span>
+      <button id="overlap-inc-btn" class="overlap-step-btn" title="Increase by 1px" aria-label="Increase overlap by 1 pixel">+</button>
+      <button id="zoom-toggle-btn" class="overlap-step-btn text-btn" title="Zoom into the seam edge" aria-pressed="false">Zoom</button>
+      <button id="overlap-auto-btn" title="Detect the best overlap for these images">Auto</button>
+      <label class="fit-toggle-label" title="Cross-fade blend instead of hard paste">
+        <input type="checkbox" id="overlap-fade-toggle" class="fit-toggle-input">
+        <span class="fit-toggle-switch"></span>
+        <span>Fade</span>
+      </label>
+    </div>
+    </div>
+    <button id="add-images-btn" class="ghost-btn" style="display:none" title="Add more images to the end">Add Images</button>
+    <button id="quit-btn" title="Stop the Image Stitcher server (click twice)">Quit</button>
+  </div>
+</header>
+
+<div id="app-body">
+  <div id="editor-pane">
+    <div id="drop-zone" role="button" tabindex="0" aria-label="Drop images or click to browse">
+      <svg width="36" height="36" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round"
+          d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5"/>
+      </svg>
+      <span>Drop images anywhere</span>
+      <span class="hint">or click to browse &middot; JPEG, PNG, WebP</span>
+      <input type="file" id="file-input" accept="image/*" multiple>
+    </div>
+
+    <div id="grid-outer">
+      <button id="add-top-btn" class="add-btn" title="Add an image above">+</button>
+      <div id="grid-scroll">
+        <button id="add-left-btn" class="add-btn" title="Add an image on the left">+</button>
+        <div id="grid"></div>
+        <button id="add-right-btn" class="add-btn" title="Add an image on the right">+</button>
+      </div>
+      <button id="add-bottom-btn" class="add-btn" title="Add an image below">+</button>
+    </div>
+  </div>
+
+  <div id="preview-pane">
+    <div id="preview-img-wrap">
+      <img id="preview-img" alt="Stitched preview">
+      <canvas id="preview-live" aria-label="Live preview" style="display:none"></canvas>
+    </div>
+    <div id="zoom-panel" style="display:none">
+      <canvas id="zoom-canvas" aria-label="Magnified view of the seam"></canvas>
+      <div class="zoom-bar">
+        <span>Magnify</span>
+        <button class="zoom-level-btn" data-zoom="2">2×</button>
+        <button class="zoom-level-btn active" data-zoom="3">3×</button>
+        <button class="zoom-level-btn" data-zoom="4">4×</button>
+        <span class="zoom-hint">Drag to pan · blue lines mark the overlap</span>
+      </div>
+    </div>
+    <div id="preview-footer">
+      <span id="preview-caption"></span>
+      <button id="download-btn" type="button" title="Save the full-quality JPEG (⌘↵)">Download</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" role="status" aria-live="polite">
+  <span id="toast-msg"></span>
+  <button id="toast-undo" class="ghost-btn">Undo <kbd>⌘Z</kbd></button>
+</div>
+
+<div id="stopped" role="status" aria-live="polite">
+  <strong>Image Stitcher has stopped</strong>
+  <span>You can close this tab. Run <code>jpegconcat</code> to start it again.</span>
+</div>
+
+<div id="processing">
+  <div class="spinner"></div>
+  <span>Stitching&hellip;</span>
+</div>
+
+<script src="static/app.js"></script>
+</body>
+</html>

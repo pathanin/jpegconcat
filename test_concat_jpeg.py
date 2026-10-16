@@ -792,8 +792,20 @@ class TestWebApp:
         assert b'id="quit-btn"' in res.data
 
     def test_quit_closes_tab(self):
-        res = self._client().get("/")
+        res = self._client().get("/static/app.js")
         assert b"window.close()" in res.data
+
+    def test_every_asset_the_page_references_is_served(self):
+        """A renamed or missing file in web/ would 404 and break the UI."""
+        import re
+        client = self._client()
+        html = client.get("/").get_data(as_text=True)
+        assets = re.findall(r'(?:href|src)="(static/[^"]+)"', html)
+        assert assets, "expected the page to reference its CSS and JS"
+        for path in assets:
+            res = client.get("/" + path)
+            assert res.status_code == 200, path
+            assert res.data, path
 
     def test_quit_invokes_callback(self):
         calls = []
@@ -859,48 +871,35 @@ class TestWebApp:
         assert res.status_code == 400
 
 
-class TestWebUIScript:
-    """Static checks on the embedded web UI, which has no JS test suite."""
+class TestWebUIFiles:
+    """Static checks on web/, which has no JS test suite of its own."""
 
-    def _script(self):
-        import re
-        return re.search(r"<script>(.*)</script>", cj._WEB_UI_HTML, re.S).group(1)
+    @staticmethod
+    def _read(name):
+        return (cj._WEB_DIR / name).read_text(encoding="utf-8")
 
     @pytest.mark.skipif(not __import__("shutil").which("node"), reason="node not installed")
-    def test_script_is_valid_javascript(self, tmp_path):
+    def test_script_is_valid_javascript(self):
         import subprocess
-        js = tmp_path / "ui.js"
-        js.write_text(self._script())
-        res = subprocess.run(["node", "--check", str(js)], capture_output=True, text=True)
+        res = subprocess.run(["node", "--check", str(cj._WEB_DIR / "app.js")],
+                             capture_output=True, text=True)
         assert res.returncode == 0, res.stderr
 
     def test_every_looked_up_id_exists(self):
-        import re
-        ids = set(re.findall(r'id="([^"]+)"', cj._WEB_UI_HTML))
-        used = set(re.findall(r"getElementById\('([^']+)'\)", self._script()))
-        assert used, "expected getElementById lookups in the script"
-        assert used <= ids, f"script looks up missing ids: {sorted(used - ids)}"
-
-
-# ── Tests: embedded web UI ────────────────────────────────────────────────────
-
-class TestWebUIHtml:
-    def test_every_element_lookup_has_a_matching_id(self):
         """A getElementById for a removed element returns null and throws at
         load, breaking the whole UI — pytest never runs the JS, so check here."""
         import re
-        html = cj._WEB_UI_HTML
-        looked_up = set(re.findall(r"getElementById\('([^']+)'\)", html))
-        defined = set(re.findall(r'\bid="([^"]+)"', html))
-        assert looked_up, "expected some getElementById calls"
-        assert looked_up <= defined, f"missing ids: {sorted(looked_up - defined)}"
+        ids = set(re.findall(r'\bid="([^"]+)"', self._read("index.html")))
+        used = set(re.findall(r"getElementById\('([^']+)'\)", self._read("app.js")))
+        assert used, "expected getElementById lookups in the script"
+        assert used <= ids, f"script looks up missing ids: {sorted(used - ids)}"
 
     def test_overlap_defaults_to_zero(self):
         import re
-        html = cj._WEB_UI_HTML
+        html = self._read("index.html")
         assert re.search(r'id="overlap-slider"[^>]*value="0"', html)
         assert '<span id="overlap-val">0 px</span>' in html
 
     def test_download_is_a_keyboard_reachable_button(self):
         """An <a> without href can't take focus; Download must stay a button."""
-        assert '<button id="download-btn"' in cj._WEB_UI_HTML
+        assert '<button id="download-btn"' in self._read("index.html")
