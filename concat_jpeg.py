@@ -1604,13 +1604,13 @@ body.loading, body.loading * { cursor: progress !important; }
     </div>
 
     <div id="grid-outer">
-      <button id="add-top-btn" class="add-btn" title="Add row above">+</button>
+      <button id="add-top-btn" class="add-btn" title="Add an image above">+</button>
       <div id="grid-scroll">
-        <button id="add-left-btn" class="add-btn" title="Add column before">+</button>
+        <button id="add-left-btn" class="add-btn" title="Add an image on the left">+</button>
         <div id="grid"></div>
-        <button id="add-right-btn" class="add-btn" title="Add column after">+</button>
+        <button id="add-right-btn" class="add-btn" title="Add an image on the right">+</button>
       </div>
-      <button id="add-bottom-btn" class="add-btn" title="Add row below">+</button>
+      <button id="add-bottom-btn" class="add-btn" title="Add an image below">+</button>
     </div>
   </div>
 
@@ -2123,11 +2123,9 @@ function updateStatus() {
   if (_statusError) { statusEl.textContent = _statusError; return; }
   if (!hasImages()) { statusEl.textContent = 'Drop images to start'; return; }
   const n = imgCount();
-  let s = `${n} image${n !== 1 ? 's' : ''} · ${nRows()}×${nCols()} grid`;
-  if (overlapCtrl.style.display !== 'none') {
-    s += ` · ${overlapSlider.value}px overlap`;
-  }
-  statusEl.textContent = s;
+  statusEl.textContent = n === 1
+    ? '1 image · add another to stitch'
+    : `${n} images · ${nRows()}×${nCols()} grid`;
 }
 
 const previewPane    = document.getElementById('preview-pane');
@@ -2417,10 +2415,27 @@ fileInput.addEventListener('change', e => {
   fileInput.value = '';
 });
 
-addLeftBtn.addEventListener('click', () => { if (hasImages()) { _finalizeUndo(); insertCol(-1); render(); } });
-addRightBtn.addEventListener('click', () => { if (hasImages()) { _finalizeUndo(); insertCol(nCols() - 1); render(); } });
-addTopBtn.addEventListener('click', () => { if (hasImages()) { _finalizeUndo(); insertRow(-1); render(); } });
-addBottomBtn.addEventListener('click', () => { if (hasImages()) { _finalizeUndo(); insertRow(nRows() - 1); render(); } });
+// Edge "+" buttons open a new row/column and go straight to the picker
+// for its first slot; cancelling the picker removes the empty slot again.
+function addAtEdge(insert, target) {
+  if (!hasImages()) return;
+  _finalizeUndo();
+  insert();
+  render();
+  const [r, c] = target();
+  openPicker(r, c);
+}
+addLeftBtn.addEventListener('click',   () => addAtEdge(() => insertCol(-1),          () => [0, 0]));
+addRightBtn.addEventListener('click',  () => addAtEdge(() => insertCol(nCols() - 1), () => [0, nCols() - 1]));
+addTopBtn.addEventListener('click',    () => addAtEdge(() => insertRow(-1),          () => [0, 0]));
+addBottomBtn.addEventListener('click', () => addAtEdge(() => insertRow(nRows() - 1), () => [nRows() - 1, 0]));
+fileInput.addEventListener('cancel', () => {
+  if (fileInput.dataset.targetR === undefined) return;
+  delete fileInput.dataset.targetR;
+  delete fileInput.dataset.targetC;
+  compact();
+  render();
+});
 
 function _buildFormData() {
   const formData = new FormData();
@@ -2656,7 +2671,10 @@ async function updateLivePreview() {
   const cv  = _liveCanvas;
   if (cv.width !== cvW || cv.height !== cvH) { cv.width = cvW; cv.height = cvH; }
   const ctx = cv.getContext('2d');
-  ctx.clearRect(0, 0, cvW, cvH);
+  // _stitch_grid fills uncovered canvas with black; match it so the
+  // preview doesn't hide bars that Download will contain.
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, cvW, cvH);
 
   let pos = 0;
   for (let i = 0; i < entries.length; i++) {
@@ -2681,7 +2699,10 @@ async function updateLivePreview() {
 
   _liveDrawCount++;
   _showPreview(previewLive, cvW >= cvH);
-  _setPreviewState('live');
+  const uneven = new Set(entries.map(e => horizontal ? e.h : e.w)).size > 1;
+  _setPreviewState('live', uneven
+    ? 'Quick preview · Sizes differ, so gaps save as black. Turn on Fit to fill them.'
+    : null);
   updateStatus();
 }
 
