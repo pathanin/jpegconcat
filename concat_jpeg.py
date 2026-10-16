@@ -564,6 +564,12 @@ def concat_images(image_paths, output_path=None, direction="auto", order="auto",
     _first = Image.open(image_paths[0])
     _first_format = _first.format
     _first_exif = _first.info.get('exif') if _first_format == "JPEG" else None
+    if _first_exif and _first.getexif().get(0x0112, 1) != 1:
+        # Pixels get exif_transpose'd below, so the copied EXIF must not ask
+        # viewers to rotate them a second time.
+        _ex = _first.getexif()
+        _ex[0x0112] = 1
+        _first_exif = _ex.tobytes()
 
     if output_path is None:
         fmt = _first.format or "JPEG"
@@ -580,9 +586,14 @@ def concat_images(image_paths, output_path=None, direction="auto", order="auto",
 
     images = []
     input_formats = []
+    # jpegtran -drop works on the stored (unrotated, unresized) DCT data, so
+    # the lossless path is only valid when the decoded pixels match the file.
+    pixels_differ_from_file = False
     for p in image_paths:
         with Image.open(p) as img:
             input_formats.append(img.format)
+            if img.getexif().get(0x0112, 1) != 1:
+                pixels_differ_from_file = True
             images.append(ImageOps.exif_transpose(img).convert("RGB"))
 
     preserve_order  = (order != "auto")
@@ -623,6 +634,7 @@ def concat_images(image_paths, output_path=None, direction="auto", order="auto",
     print(f"\nLayout: {direction}")
 
     if fit:
+        pre_fit_sizes = [img.size for img in images]
         if direction == "horizontal":
             target_h = max(img.height for img in images)
             images = [
@@ -638,6 +650,8 @@ def concat_images(image_paths, output_path=None, direction="auto", order="auto",
                 for img in images
             ]
         print(f"Fit: resized images to share {'height' if direction == 'horizontal' else 'width'}")
+        if [img.size for img in images] != pre_fit_sizes:
+            pixels_differ_from_file = True
 
     # Detect encoding params from the first input image
     first = image_paths[0]
@@ -667,7 +681,7 @@ def concat_images(image_paths, output_path=None, direction="auto", order="auto",
 
     if overlap > 0:
         print("Note: overlap disables the lossless jpegtran fast-path; re-encoding via Pillow.")
-    lossless = overlap == 0 and _try_lossless(image_paths, images, input_formats, output_path, direction, qtables, subsampling, all_subsampling=all_subsampling)
+    lossless = overlap == 0 and not pixels_differ_from_file and _try_lossless(image_paths, images, input_formats, output_path, direction, qtables, subsampling, all_subsampling=all_subsampling)
 
     # ── Pillow re-encode fallback ─────────────────────────────────────────────
     if not lossless:

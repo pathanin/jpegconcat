@@ -449,6 +449,43 @@ class TestLosslessPath:
         # Should succeed via Pillow fallback
         assert os.path.exists(output)
 
+    def test_fit_resize_skips_lossless(self, tmpdir):
+        """--fit resizes pixels, so jpegtran (which drops the original files)
+        must not be used — otherwise the resized slot ends up black."""
+        a = Image.new("RGB", (320, 480), (255, 0, 0))
+        b = Image.new("RGB", (160, 240), (0, 255, 0))
+        path_a, path_b = os.path.join(tmpdir, "a.jpg"), os.path.join(tmpdir, "b.jpg")
+        a.save(path_a, "JPEG", quality=90)
+        b.save(path_b, "JPEG", quality=90)
+        output = os.path.join(tmpdir, "out.jpg")
+        cj.concat_images([path_a, path_b], output, direction="horizontal", order="as-given", fit=True)
+        result = Image.open(output).convert("RGB")
+        assert result.size == (640, 480)
+        r, g, b_ = result.getpixel((480, 400))
+        assert g > 200 and r < 60, "fit-resized image must fill its slot"
+
+    def test_exif_rotated_input_skips_lossless(self, tmpdir):
+        """An EXIF-rotated input is stored unrotated on disk; the lossless path
+        would drop it sideways, so the Pillow path must be used instead."""
+        src = Image.new("RGB", (480, 320), (0, 0, 255))
+        src.paste((255, 255, 0), (0, 0, 240, 320))  # left half yellow
+        ex = Image.Exif()
+        ex[0x0112] = 6  # display rotated 90° CW
+        path_a = os.path.join(tmpdir, "a.jpg")
+        src.save(path_a, "JPEG", quality=90, exif=ex.tobytes())
+        path_b = os.path.join(tmpdir, "b.jpg")
+        Image.new("RGB", (320, 480), (0, 255, 0)).save(path_b, "JPEG", quality=90)
+        output = os.path.join(tmpdir, "out.jpg")
+        cj.concat_images([path_a, path_b], output, direction="horizontal", order="as-given")
+        out = Image.open(output)
+        # Pixels are already upright, so the output must not ask viewers to rotate again
+        assert out.getexif().get(0x0112, 1) == 1
+        result = out.convert("RGB")
+        assert result.size == (640, 480)
+        # Rotated 90° CW: the source's left (yellow) half becomes the top half
+        assert result.getpixel((160, 100))[2] < 80      # yellow
+        assert result.getpixel((160, 400))[2] > 180     # blue
+
     def test_lossless_not_taken_without_jpegtran(self, tmpdir):
         """No jpegtran → _try_lossless returns False."""
         paths = self._mcu_aligned_images(tmpdir)
