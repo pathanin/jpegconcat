@@ -1017,7 +1017,26 @@ h1 {
 #preview-pane[data-state="pending"] #preview-img,
 #preview-pane[data-state="pending"] #preview-live { opacity: 0.35; transition: opacity 0.15s; }
 
-#status.error { color: #1d1d1f; font-weight: 600; }
+#status.error {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #1d1d1f;
+  font-weight: 600;
+}
+#status.error::before {
+  content: '!';
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #1d1d1f;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+}
 body.loading, body.loading * { cursor: progress !important; }
 
 .ghost-btn {
@@ -1119,6 +1138,7 @@ body.loading, body.loading * { cursor: progress !important; }
 
 #grid {
   display: inline-grid;
+  place-items: center;
   gap: 6px;
   background: transparent;
   padding: 6px;
@@ -1197,13 +1217,13 @@ body.loading, body.loading * { cursor: progress !important; }
   position: absolute;
   top: 4px;
   right: 4px;
-  width: 20px;
-  height: 20px;
+  width: 24px;
+  height: 24px;
   background: rgba(0,0,0,0.55);
   border: none;
-  border-radius: 4px;
-  color: #ccc;
-  font-size: 13px;
+  border-radius: 8px;
+  color: rgba(255,255,255,0.85);
+  font-size: 15px;
   cursor: pointer;
   display: flex;
   align-items: center;
@@ -1223,12 +1243,12 @@ body.loading, body.loading * { cursor: progress !important; }
   bottom: 0;
   left: 0;
   right: 0;
-  height: 26px;
+  height: 32px;
   background: rgba(0,0,0,0.65);
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 1px;
+  gap: 2px;
   opacity: 0;
   transition: opacity 0.12s;
   z-index: 4;
@@ -1256,22 +1276,29 @@ body.loading, body.loading * { cursor: progress !important; }
   letter-spacing: -0.224px;
   color: #1d1d1f;
   opacity: 0;
+  visibility: hidden;
   pointer-events: none;
-  transition: opacity 0.15s, transform 0.15s;
+  transition: opacity 0.15s, transform 0.15s, visibility 0s 0.15s;
   z-index: 150;
 }
-#toast.visible { opacity: 1; transform: translateX(-50%); pointer-events: auto; }
+#toast.visible {
+  opacity: 1;
+  visibility: visible;
+  transform: translateX(-50%);
+  pointer-events: auto;
+  transition: opacity 0.15s, transform 0.15s;
+}
 #toast kbd { font-family: inherit; color: #7a7a7a; }
 
 .btn-transform {
-  width: 24px;
-  height: 22px;
+  width: 32px;
+  height: 28px;
   background: transparent;
   border: none;
-  color: #ccc;
-  font-size: 13px;
+  color: rgba(255,255,255,0.85);
+  font-size: 15px;
   cursor: pointer;
-  border-radius: 3px;
+  border-radius: 8px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1349,6 +1376,15 @@ body.loading, body.loading * { cursor: progress !important; }
   flex-shrink: 0;
 }
 .overlap-step-btn:hover { border-color: #0066cc; color: #0066cc; }
+
+/* Small controls keep their look but get a ~44px hit area. */
+.overlap-step-btn, #overlap-auto-btn, .zoom-level-btn, .add-btn { position: relative; }
+.overlap-step-btn::before, #overlap-auto-btn::before, .zoom-level-btn::before {
+  content: ''; position: absolute; inset: -11px -3px;
+}
+.btn-remove::before { content: ''; position: absolute; inset: -10px; }
+#add-left-btn::before, #add-right-btn::before { content: ''; position: absolute; inset: 0 -11px; }
+#add-top-btn::before, #add-bottom-btn::before { content: ''; position: absolute; inset: -11px 0; }
 .overlap-step-btn:active { transform: scale(0.95); }
 .overlap-step-btn.active { border-color: #0066cc; color: #0066cc; background: rgba(0,102,204,0.06); }
 .overlap-step-btn:focus-visible, #overlap-auto-btn:focus-visible, .zoom-level-btn:focus-visible {
@@ -1409,14 +1445,6 @@ body.loading, body.loading * { cursor: progress !important; }
 }
 #overlap-auto-btn:hover { border-color: #0066cc; color: #0066cc; }
 #overlap-auto-btn.active { border-color: #0066cc; color: #0066cc; background: rgba(0,102,204,0.06); }
-
-.toolbar-sep {
-  width: 1px;
-  height: 14px;
-  background: #555;
-  margin: 0 2px;
-  flex-shrink: 0;
-}
 
 .add-btn {
   background: transparent;
@@ -1525,8 +1553,8 @@ body.loading, body.loading * { cursor: progress !important; }
 
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: #ccc; border-radius: 3px; }
-::-webkit-scrollbar-thumb:hover { background: #aaa; }
+::-webkit-scrollbar-thumb { background: #e0e0e0; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #7a7a7a; }
 </style>
 </head>
 <body>
@@ -2147,9 +2175,14 @@ function buildCell(cell, r, c) {
   el.className = 'cell';
   el.draggable = true;
   el.tabIndex = 0;
-  el.setAttribute('aria-label', `${cell.name}, row ${r + 1}, column ${c + 1}. Delete to remove.`);
+  el.setAttribute('aria-label',
+    `${cell.name}, row ${r + 1}, column ${c + 1}. R to rotate, H or V to flip, Delete to remove.`);
   el.addEventListener('keydown', e => {
-    if (e.target !== el) return;
+    if (e.target !== el || e.metaKey || e.ctrlKey || e.altKey) return;
+    const key = e.key.toLowerCase();
+    const transform = key === 'r' ? (e.shiftKey ? 'rotate-ccw' : 'rotate-cw')
+                    : key === 'h' ? 'flip-h' : key === 'v' ? 'flip-v' : null;
+    if (transform) { e.preventDefault(); applyTransform(r, c, transform); return; }
     if (e.key === 'Delete' || e.key === 'Backspace') {
       e.preventDefault();
       removeCell(r, c);
@@ -2178,7 +2211,9 @@ function buildCell(cell, r, c) {
 
   const rmBtn = document.createElement('button');
   rmBtn.className = 'btn-remove';
-  rmBtn.title = 'Remove';
+  rmBtn.title = 'Remove (Delete)';
+  rmBtn.setAttribute('aria-label', 'Remove');
+  rmBtn.tabIndex = -1;
   rmBtn.textContent = '×';
   rmBtn.addEventListener('click', e => { e.stopPropagation(); removeCell(r, c); render(); });
   el.appendChild(rmBtn);
@@ -2186,10 +2221,10 @@ function buildCell(cell, r, c) {
   const toolbar = document.createElement('div');
   toolbar.className = 'cell-toolbar';
   toolbar.innerHTML =
-    '<button class="btn-transform" title="Rotate CCW" aria-label="Rotate counter-clockwise">↺</button>' +
-    '<button class="btn-transform" title="Rotate CW" aria-label="Rotate clockwise">↻</button>' +
-    '<button class="btn-transform" title="Flip horizontal" aria-label="Flip horizontal">↔</button>' +
-    '<button class="btn-transform" title="Flip vertical" aria-label="Flip vertical">↕</button>';
+    '<button class="btn-transform" tabindex="-1" title="Rotate counter-clockwise (⇧R)" aria-label="Rotate counter-clockwise">↺</button>' +
+    '<button class="btn-transform" tabindex="-1" title="Rotate clockwise (R)" aria-label="Rotate clockwise">↻</button>' +
+    '<button class="btn-transform" tabindex="-1" title="Flip horizontal (H)" aria-label="Flip horizontal">↔</button>' +
+    '<button class="btn-transform" tabindex="-1" title="Flip vertical (V)" aria-label="Flip vertical">↕</button>';
   const [rotateCCW, rotateCW, flipH, flipV] = toolbar.children;
   rotateCCW.addEventListener('click', e => { e.stopPropagation(); applyTransform(r, c, 'rotate-ccw'); });
   rotateCW .addEventListener('click', e => { e.stopPropagation(); applyTransform(r, c, 'rotate-cw'); });
