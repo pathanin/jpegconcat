@@ -3,8 +3,8 @@ class Jpegconcat < Formula
 
   desc "Concatenate JPEG images while preserving original encoding parameters"
   homepage "https://github.com/pathanin/jpegconcat"
-  url "https://github.com/pathanin/jpegconcat/releases/download/v0.2.8/jpegconcat-0.2.8.tar.gz"
-  sha256 "22f3999aa7c72a2e22759750070ab8d10dad5bca620b6b0e8ac66ac3523546d7"
+  url "https://github.com/pathanin/jpegconcat/releases/download/v0.3.0/jpegconcat-0.3.0.tar.gz"
+  sha256 "cf38e37b28d22a9477bf3072ffb46b53e17a8b9ea911a6d54d5501ee21195e2b"
   license "MIT"
 
   depends_on "python@3.12"
