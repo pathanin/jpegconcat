@@ -811,8 +811,10 @@ header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 24px;
-  height: 52px;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  padding: 8px 24px;
+  min-height: 52px;
   background: #f5f5f7;
   border-bottom: 1px solid #e0e0e0;
   flex-shrink: 0;
@@ -834,6 +836,7 @@ h1 {
 
 .capsule {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 14px;
   padding: 6px 12px;
@@ -849,8 +852,11 @@ h1 {
 
 .header-right {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 14px;
+  justify-content: flex-end;
+  gap: 8px 14px;
+  margin-left: auto;
 }
 
 #status {
@@ -914,6 +920,11 @@ h1 {
   transform: translateX(16px);
 }
 
+.fit-toggle-input:focus-visible + .fit-toggle-switch {
+  outline: 2px solid #0071e3;
+  outline-offset: 2px;
+}
+
 .ghost-btn, #quit-btn, #download-btn {
   height: 36px;
   padding: 0 18px;
@@ -939,8 +950,8 @@ h1 {
 
 #editor-pane {
   display: flex;
-  align-items: center;
-  justify-content: center;
+  align-items: safe center;
+  justify-content: safe center;
   padding: 28px;
   overflow: auto;
   flex-shrink: 0;
@@ -971,7 +982,7 @@ h1 {
 #preview-img-wrap {
   flex: 1;
   align-self: stretch;
-  min-height: 0;
+  min-height: 64px;
   min-width: 0;
   position: relative;
 }
@@ -1031,12 +1042,12 @@ body.loading, body.loading * { cursor: progress !important; }
   font-family: inherit;
   font-weight: 400;
   cursor: pointer;
-  text-decoration: none;
   transition: opacity 0.12s, transform 0.08s;
   white-space: nowrap;
 }
 
-#download-btn:hover { opacity: 0.85; }
+#download-btn:hover:not(:disabled) { opacity: 0.85; }
+#download-btn:disabled { cursor: progress; }
 #download-btn:active { transform: scale(0.95); }
 #download-btn:focus-visible {
   outline: 2px solid #0071e3;
@@ -1145,8 +1156,13 @@ body.loading, body.loading * { cursor: progress !important; }
   justify-content: center;
   color: #7a7a7a;
   font-size: 1.3rem;
-  cursor: default;
+  cursor: pointer;
   transition: border-color 0.1s, color 0.1s, background 0.1s;
+}
+
+.cell.empty:hover {
+  border-color: #0066cc;
+  color: #0066cc;
 }
 
 .cell.empty.drag-over-empty {
@@ -1216,7 +1232,7 @@ body.loading, body.loading * { cursor: progress !important; }
   opacity: 0;
   transition: opacity 0.12s;
   z-index: 4;
-  border-radius: 0 0 4px 4px;
+  border-radius: 0 0 7px 7px;
 }
 
 .cell:hover .cell-toolbar,
@@ -1361,6 +1377,26 @@ body.loading, body.loading * { cursor: progress !important; }
   flex-shrink: 0;
 }
 #overlap-auto-btn:active, .zoom-level-btn:active { transform: scale(0.95); }
+#zoom-panel { align-self: stretch; flex-shrink: 0; }
+#zoom-canvas {
+  width: 100%;
+  display: block;
+  height: clamp(80px, 18vh, 200px);
+  image-rendering: pixelated;
+  border-radius: 8px;
+  background: #1d1d1f;
+  cursor: grab;
+}
+.zoom-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  font-size: 12px;
+  color: #7a7a7a;
+}
+.zoom-hint { margin-left: 8px; }
+
 #overlap-auto-btn {
   font-family: inherit;
   font-weight: 400;
@@ -1508,12 +1544,12 @@ body.loading, body.loading * { cursor: progress !important; }
       <span>Fit images to layout</span>
     </label>
     <div id="overlap-control" style="display:none">
-      <span>Overlap</span>
+      <label for="overlap-slider">Overlap</label>
       <input type="range" id="overlap-slider" min="0" max="800" value="0" step="1">
-      <button id="overlap-dec-btn" class="overlap-step-btn" title="Decrease by 1px">−</button>
+      <button id="overlap-dec-btn" class="overlap-step-btn" title="Decrease by 1px" aria-label="Decrease overlap by 1 pixel">−</button>
       <span id="overlap-val">0 px</span>
-      <button id="overlap-inc-btn" class="overlap-step-btn" title="Increase by 1px">+</button>
-      <button id="zoom-toggle-btn" class="overlap-step-btn text-btn" title="Zoom into the seam edge">Zoom</button>
+      <button id="overlap-inc-btn" class="overlap-step-btn" title="Increase by 1px" aria-label="Increase overlap by 1 pixel">+</button>
+      <button id="zoom-toggle-btn" class="overlap-step-btn text-btn" title="Zoom into the seam edge" aria-pressed="false">Zoom</button>
       <button id="overlap-auto-btn" title="Detect the best overlap for these images">Auto</button>
       <label class="fit-toggle-label" title="Cross-fade blend instead of hard paste">
         <input type="checkbox" id="overlap-fade-toggle" class="fit-toggle-input">
@@ -1555,19 +1591,19 @@ body.loading, body.loading * { cursor: progress !important; }
       <img id="preview-img" alt="Stitched preview">
       <canvas id="preview-live" aria-label="Live preview" style="display:none"></canvas>
     </div>
-    <div id="zoom-panel" style="display:none;margin-top:6px">
-      <canvas id="zoom-canvas" style="width:100%;display:block;image-rendering:pixelated;border-radius:5px;background:#2c2c2e;cursor:grab"></canvas>
-      <div style="display:flex;align-items:center;gap:5px;margin-top:4px;font-size:11px;color:#888">
-        <span>Zoom:</span>
+    <div id="zoom-panel" style="display:none">
+      <canvas id="zoom-canvas" aria-label="Magnified view of the seam"></canvas>
+      <div class="zoom-bar">
+        <span>Magnify</span>
         <button class="zoom-level-btn" data-zoom="2">2×</button>
         <button class="zoom-level-btn active" data-zoom="3">3×</button>
         <button class="zoom-level-btn" data-zoom="4">4×</button>
-        <span style="margin-left:6px">Drag to pan · blue = overlap bounds</span>
+        <span class="zoom-hint">Drag to pan · blue lines mark the overlap</span>
       </div>
     </div>
     <div id="preview-footer">
       <span id="preview-caption"></span>
-      <a id="download-btn" download="stitched.jpg" title="Save the full-quality JPEG (⌘↵)">Download</a>
+      <button id="download-btn" type="button" title="Save the full-quality JPEG (⌘↵)">Download</button>
     </div>
   </div>
 </div>
@@ -1683,6 +1719,7 @@ zoomToggleBtn.addEventListener('click', () => {
   _zoomOffsetX = null;
   _zoomOffsetY = null;
   zoomToggleBtn.classList.toggle('active', _zoomActive);
+  zoomToggleBtn.setAttribute('aria-pressed', _zoomActive);
   if (!_zoomActive) zoomPanel.style.display = 'none';
   scheduleLivePreview();
 });
@@ -2031,19 +2068,13 @@ function render() {
   // would have no effect.
   const overlapApplies = rows === 1 || cols === 1;
   overlapCtrl.style.display = (n >= 2 && overlapApplies) ? 'flex' : 'none';
-  // The seam zoom is only drawn for side-by-side seams.
-  zoomToggleBtn.style.display = rows === 1 ? '' : 'none';
-  if (rows !== 1 && _zoomActive) {
-    _zoomActive = false;
-    zoomToggleBtn.classList.remove('active');
-    zoomPanel.style.display = 'none';
-  }
   // The seam zoom only draws for side-by-side layouts.
   const zoomApplies = rows === 1;
   zoomToggleBtn.style.display = zoomApplies ? '' : 'none';
   if (!zoomApplies && _zoomActive) {
     _zoomActive = false;
     zoomToggleBtn.classList.remove('active');
+    zoomToggleBtn.setAttribute('aria-pressed', 'false');
     zoomPanel.style.display = 'none';
   }
   onLayoutChanged();
@@ -2217,8 +2248,14 @@ function buildEmptyCell(r, c) {
   el.dataset.r = r;
   el.dataset.c = c;
   el.textContent = '+';
+  el.tabIndex = 0;
+  el.setAttribute('role', 'button');
+  el.setAttribute('aria-label', `Add image at row ${r + 1}, column ${c + 1}`);
   el.addEventListener('dragover', e => { e.preventDefault(); });
   el.addEventListener('click', () => openPicker(r, c));
+  el.addEventListener('keydown', e => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openPicker(r, c); }
+  });
   return el;
 }
 
@@ -2404,9 +2441,11 @@ const _bitmapCache = {};  // cell.id → ImageBitmap
 function _renderZoomStrip({ cv, dw0, ov, cvW, cvH }) {
   const ZOOM   = _zoomLevel;
   const zc     = zoomCanvas;
-  const panelW = zoomPanel.offsetWidth || 600;
-  zc.width     = panelW;
-  zc.height    = 200;
+  // Measure after showing: a hidden panel has no size. The CSS box sets
+  // the size; the backing store just matches it so pixels stay square.
+  zoomPanel.style.display = 'block';
+  zc.width     = Math.max(1, zc.clientWidth);
+  zc.height    = Math.max(1, zc.clientHeight);
 
   // How many source pixels fit in this viewport at the chosen zoom level
   const vpW = Math.ceil(zc.width  / ZOOM);
@@ -2428,12 +2467,14 @@ function _renderZoomStrip({ cv, dw0, ov, cvW, cvH }) {
   zctx.drawImage(cv, srcX, srcY, vpW, vpH, 0, 0, zc.width, zc.height);
 
   // Mark overlap left/right boundaries
-  zctx.strokeStyle = 'rgba(0,180,255,0.75)';
-  zctx.lineWidth   = 2;
+  // Accent line on a white under-stroke so it reads on dark and light photos.
   for (const natX of [seamL, dw0]) {
     const mx = (natX - srcX) * ZOOM;
     if (mx >= 0 && mx <= zc.width) {
-      zctx.beginPath(); zctx.moveTo(mx, 0); zctx.lineTo(mx, zc.height); zctx.stroke();
+      for (const [style, w] of [['#ffffff', 4], ['#0066cc', 2]]) {
+        zctx.strokeStyle = style; zctx.lineWidth = w;
+        zctx.beginPath(); zctx.moveTo(mx, 0); zctx.lineTo(mx, zc.height); zctx.stroke();
+      }
     }
   }
   zoomPanel.style.display = 'block';
@@ -2741,13 +2782,12 @@ function _downloadName() {
   return (base || 'stitched') + (base ? '_stitched' : '') + '.jpg';
 }
 
-downloadBtn.addEventListener('click', async e => {
-  e.preventDefault();
-  if (!hasImages()) return;
+downloadBtn.addEventListener('click', async () => {
+  if (!hasImages() || downloadBtn.disabled) return;
   _statusError = null;
   const prev = downloadBtn.textContent;
   downloadBtn.textContent = 'Downloading…';
-  downloadBtn.style.pointerEvents = 'none';
+  downloadBtn.disabled = true;
   try {
     const sig = _requestSignature();
     let blob;
@@ -2768,7 +2808,7 @@ downloadBtn.addEventListener('click', async e => {
   } finally {
     processingEl.classList.remove('visible');
     downloadBtn.textContent = prev;
-    downloadBtn.style.pointerEvents = '';
+    downloadBtn.disabled = false;
   }
 });
 </script>
