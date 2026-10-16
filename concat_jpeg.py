@@ -979,6 +979,27 @@ h1 {
   background: #ffffff;
 }
 
+#preview-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  align-self: stretch;
+  flex-shrink: 0;
+}
+
+#preview-caption {
+  font-size: 14px;
+  letter-spacing: -0.224px;
+  color: #7a7a7a;
+  min-width: 0;
+}
+
+#preview-pane[data-state="final"] #preview-caption { color: #1d1d1f; }
+#preview-pane[data-state="stale"] #preview-caption { color: #1d1d1f; font-weight: 600; }
+#preview-pane[data-state="stale"] #preview-img,
+#preview-pane[data-state="stale"] #preview-live { opacity: 0.35; transition: opacity 0.15s; }
+
 #download-btn {
   display: inline-block;
   padding: 11px 22px;
@@ -1482,7 +1503,10 @@ h1 {
         <span style="margin-left:6px">Drag to pan · blue = overlap bounds</span>
       </div>
     </div>
-    <a id="download-btn" download="stitched.jpg">Download</a>
+    <div id="preview-footer">
+      <span id="preview-caption"></span>
+      <a id="download-btn" download="stitched.jpg">Download</a>
+    </div>
   </div>
 </div>
 
@@ -1552,10 +1576,17 @@ overlapSlider.addEventListener('input', () => {
   scheduleLivePreview();
 });
 
+// Auto overlap is detected server-side, so clicking Auto runs a stitch to
+// get the value — otherwise the button would look like it did nothing.
 overlapAutoBtn.addEventListener('click', () => {
   overlapIsAuto = true;
   overlapAutoBtn.classList.add('active');
+  overlapValEl.textContent = 'Auto';
+  updateStatus();
+  if (imgCount() >= 2) stitchBtn.click();
 });
+
+document.getElementById('fit-toggle').addEventListener('change', () => onLayoutChanged());
 
 function _stepOverlap(delta) {
   const v = Math.min(parseInt(overlapSlider.max), Math.max(0, parseInt(overlapSlider.value) + delta));
@@ -1759,6 +1790,7 @@ async function applyTransform(r, c, type) {
     return;
   }
   updateCellInPlace(r, c);
+  onLayoutChanged();
 }
 
 // Patches a single cell's thumbnail <img> in place instead of tearing down
@@ -1829,7 +1861,8 @@ function render() {
     gridOuter.style.display = 'none';
     dropZoneEl.style.display = 'flex';
     stitchBtn.disabled = true;
-    statusEl.textContent = 'Drop images to start';
+    overlapCtrl.style.display = 'none';
+    onLayoutChanged();
     return;
   }
   dropZoneEl.style.display = 'none';
@@ -1845,13 +1878,68 @@ function render() {
     }
   }
   const n = imgCount();
-  statusEl.textContent = `${n} image${n !== 1 ? 's' : ''} · ${rows}×${cols} grid`;
   stitchBtn.disabled = n < 2;
   // Overlap only applies to single-row or single-column grids — _stitch_grid
   // silently zeroes it for any other shape, so don't show a control that
   // would have no effect.
   const overlapApplies = rows === 1 || cols === 1;
   overlapCtrl.style.display = (n >= 2 && overlapApplies) ? 'flex' : 'none';
+  // The seam zoom only draws for side-by-side layouts.
+  const zoomApplies = rows === 1;
+  zoomToggleBtn.style.display = zoomApplies ? '' : 'none';
+  if (!zoomApplies && _zoomActive) {
+    _zoomActive = false;
+    zoomToggleBtn.classList.remove('active');
+    zoomPanel.style.display = 'none';
+  }
+  onLayoutChanged();
+}
+
+// One status line, rebuilt from current state rather than overwritten by
+// whichever code path ran last.
+function updateStatus() {
+  if (!hasImages()) { statusEl.textContent = 'Drop images to start'; return; }
+  const n = imgCount();
+  let s = `${n} image${n !== 1 ? 's' : ''} · ${nRows()}×${nCols()} grid`;
+  if (overlapCtrl.style.display !== 'none') {
+    s += overlapIsAuto && overlapValEl.textContent === 'Auto' ? ' · auto overlap'
+                                                            : ` · ${overlapSlider.value}px overlap`;
+  }
+  statusEl.textContent = s;
+}
+
+const previewPane    = document.getElementById('preview-pane');
+const previewCaption = document.getElementById('preview-caption');
+
+// 'live'  — fast client-side composite (downscaled, not the final file)
+// 'final' — the server's real output for the current layout
+// 'stale' — showing an old result that no longer matches the grid
+function _setPreviewState(state, text) {
+  previewPane.dataset.state = state;
+  previewCaption.textContent = text || {
+    live:  'Quick preview · Stitch & Preview shows the final file',
+    stale: 'Out of date · press Stitch & Preview to refresh',
+  }[state] || '';
+}
+
+const _liveSupported = () => (nRows() === 1 || nCols() === 1) && imgCount() >= 2;
+
+// Called after anything that changes what the output would be: layout,
+// rotation/flip, Fit, overlap. Keeps the preview pane from showing a
+// result that Download would no longer produce.
+function onLayoutChanged() {
+  updateStatus();
+  if (imgCount() < 2) {
+    _previewGen++;  // drop any in-flight live paint
+    appBody.classList.remove('has-preview', 'layout-side', 'layout-stack');
+    return;
+  }
+  if (_liveSupported()) scheduleLivePreview();
+  else if (appBody.classList.contains('has-preview')) {
+    if (_matchesLastServerResult(_requestSignature())) return;
+    _previewGen++;
+    _setPreviewState('stale');
+  }
 }
 
 function buildCell(cell, r, c) {
@@ -1932,7 +2020,7 @@ function buildCell(cell, r, c) {
     const { r: sr, c: sc } = dragSrc;
     if (sr !== r || sc !== c) {
       const sameShape = moveCellToZone(sr, sc, r, c, zoneAt(e.clientX, e.clientY, el));
-      if (sameShape) { updateCellInPlace(sr, sc); updateCellInPlace(r, c); }
+      if (sameShape) { updateCellInPlace(sr, sc); updateCellInPlace(r, c); onLayoutChanged(); }
       else render();
     }
   });
@@ -2262,12 +2350,26 @@ async function updateLivePreview() {
   // waiting on bitmaps — don't paint a stale low-res composite over it.
   if (gen !== _previewGen) return;
 
-  const overlap = Math.max(0, parseInt(overlapSlider.value) || 0);
   const isFade  = overlapFadeToggle.checked;
+  const horizontal = direction === 'horizontal';
+
+  // Output size of each image. Mirrors _stitch_grid's fit: scale every
+  // image to the tallest height (row) or widest width (column).
+  if (document.getElementById('fit-toggle').checked) {
+    const maxH = Math.max(...entries.map(e => e.h));
+    const maxW = Math.max(...entries.map(e => e.w));
+    entries = entries.map(e => horizontal
+      ? { ...e, w: e.h === maxH ? e.w : Math.round(e.w * maxH / e.h), h: maxH }
+      : { ...e, w: maxW, h: e.w === maxW ? e.h : Math.round(e.h * maxW / e.w) });
+  }
+
+  // _stitch_grid clamps overlap to one less than the smallest image.
+  const minSide = Math.min(...entries.map(e => horizontal ? e.w : e.h));
+  const overlap = Math.min(Math.max(0, parseInt(overlapSlider.value) || 0), minSide - 1);
 
   // Natural canvas size (from full-resolution dimensions)
   let natW, natH;
-  if (direction === 'horizontal') {
+  if (horizontal) {
     natW = entries.reduce((s, e) => s + e.w, 0) - overlap * (entries.length - 1);
     natH = Math.max(...entries.map(e => e.h));
   } else {
@@ -2287,7 +2389,6 @@ async function updateLivePreview() {
   const ctx = cv.getContext('2d');
   ctx.clearRect(0, 0, cvW, cvH);
 
-  const horizontal = direction === 'horizontal';
   let pos = 0;
   for (let i = 0; i < entries.length; i++) {
     const e  = entries[i];
@@ -2311,7 +2412,8 @@ async function updateLivePreview() {
 
   _liveDrawCount++;
   _showPreview(previewLive, cvW >= cvH);
-  statusEl.textContent = `${cells.length} images · ${overlap}px overlap`;
+  _setPreviewState('live');
+  updateStatus();
 }
 
 // Counts live-canvas paints. A server result whose <img> finishes decoding
@@ -2335,6 +2437,11 @@ function scheduleLivePreview() {
   if (_livePreviewPending) return;
   _livePreviewPending = true;
   requestAnimationFrame(() => { _livePreviewPending = false; updateLivePreview(); });
+}
+
+function _fmtSize(bytes) {
+  return bytes >= 1024 * 1024 ? (bytes / 1024 / 1024).toFixed(1) + ' MB'
+                              : Math.round(bytes / 1024) + ' KB';
 }
 
 function _syncOverlapFromResponse(res) {
@@ -2367,11 +2474,15 @@ stitchBtn.addEventListener('click', async () => {
     _previewObjectURL = URL.createObjectURL(blob);
     previewImg.onload = () => {
       if (_liveDrawCount !== liveDrawsAtResult) return;  // user moved on
-      _showPreview(previewImg, previewImg.naturalWidth >= previewImg.naturalHeight);
+      const w = previewImg.naturalWidth, h = previewImg.naturalHeight;
+      _lastServerResult.caption = `Final · ${w} × ${h} px · ${_fmtSize(blob.size)}`;
+      _showPreview(previewImg, w >= h);
+      // The grid may have changed while the request was in flight.
+      if (_matchesLastServerResult(_requestSignature())) _setPreviewState('final', _lastServerResult.caption);
+      else _setPreviewState('stale');
     };
     previewImg.src = _previewObjectURL;
-    const kb = Math.round(blob.size / 1024);
-    statusEl.textContent = `Stitched · ${kb} KB`;
+    updateStatus();
   } catch (err) {
     console.error(err);
     statusEl.textContent = 'Error: ' + err.message;
